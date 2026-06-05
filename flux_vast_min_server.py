@@ -188,10 +188,12 @@ class FluxRuntime:
         return pipe
 
     def _apply_quantized_cuda(self, pipe):
+        import torch
+
         for name in ("vae",):
             component = getattr(pipe, name, None)
             if component is not None and hasattr(component, "to"):
-                component.to(self.device, dtype=self._dtype_obj())
+                component.to(self.device, dtype=torch.float32)
         try:
             pipe.set_progress_bar_config(disable=True)
         except Exception:
