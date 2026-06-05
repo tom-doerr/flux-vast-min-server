@@ -291,14 +291,13 @@ class FluxRuntime:
         from huggingface_hub import hf_hub_download
 
         token = hf_token()
-        if not token:
-            raise RuntimeError(f"HF_TOKEN/HF_API is required for gated model {FLUX2_DEV_NVFP4}")
-        auth_kwargs = {"token": token}
+        auth_kwargs = {"token": token} if token else {}
         checkpoint_path = hf_hub_download(repo_id=FLUX2_DEV_NVFP4, filename=FLUX2_DEV_NVFP4_FILE, **auth_kwargs)
         attempts = (
+            {"config": FLUX2_DEV_BNB, "subfolder": "transformer", "torch_dtype": self._dtype_obj(), **auth_kwargs},
+            {"config": FLUX2_DEV_BNB, "subfolder": "transformer", "dtype": self._dtype_obj(), **auth_kwargs},
+            {"config": FLUX2_DEV_BNB, "subfolder": "transformer", **auth_kwargs},
             {"config": FLUX2_DEV_BFL, "subfolder": "transformer", "torch_dtype": self._dtype_obj(), **auth_kwargs},
-            {"config": FLUX2_DEV_BFL, "subfolder": "transformer", "dtype": self._dtype_obj(), **auth_kwargs},
-            {"config": FLUX2_DEV_BFL, "subfolder": "transformer", **auth_kwargs},
         )
         last_exc: Exception | None = None
         for attempt in attempts:
@@ -313,11 +312,9 @@ class FluxRuntime:
         from transformers import Mistral3ForConditionalGeneration
 
         token = hf_token()
-        if not token:
-            raise RuntimeError(f"HF_TOKEN/HF_API is required for gated model {FLUX2_DEV_NVFP4}")
-        auth_kwargs = {"token": token}
+        auth_kwargs = {"token": token} if token else {}
         text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
-            FLUX2_DEV_BFL,
+            FLUX2_DEV_BNB,
             subfolder="text_encoder",
             torch_dtype=self._dtype_obj(),
             device_map="cpu",
@@ -325,7 +322,7 @@ class FluxRuntime:
         )
         transformer = self._load_dev_nvfp4_transformer()
         pipe = Flux2Pipeline.from_pretrained(
-            FLUX2_DEV_BFL,
+            FLUX2_DEV_BNB,
             text_encoder=text_encoder,
             transformer=transformer,
             torch_dtype=self._dtype_obj(),
