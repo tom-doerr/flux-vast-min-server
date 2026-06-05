@@ -14,9 +14,7 @@ It implements the subset of the local image-generation API used by Idea Rank:
 - `GET /jobs/<job_id>/images/<index>/decoded`
 - `GET /jobs/<job_id>/images/<index>/raw_vae`
 
-The default model is `black-forest-labs/FLUX.2-dev-int8`, a server-side alias that loads the gated BFL `black-forest-labs/FLUX.2-dev` weights with bitsandbytes 8-bit quantization for the text encoder and transformer. It requires `HF_TOKEN` or `HF_API` on the deployment host. The public `diffusers/FLUX.2-dev-bnb-4bit` fallback remains available as `dev-bnb-4bit`; `black-forest-labs/FLUX.2-klein-9b-fp8` remains supported when the deployment supplies its own `HF_TOKEN`/`HF_API`.
-
-BFL also publishes `black-forest-labs/FLUX.2-dev-NVFP4`, but this server does not default to it on H200 because NVFP4 is aimed at native FP4-capable Blackwell hardware, not Hopper/H200.
+The default model is `black-forest-labs/FLUX.2-dev-NVFP4`, loaded from the gated BFL NVFP4 Diffusers repository. It requires `HF_TOKEN` or `HF_API` on the deployment host and is intended for Blackwell GPUs such as B200. The explicit `dev-bfl-int8` alias remains available for the older bitsandbytes 8-bit path, `dev-bnb-4bit` remains available for `diffusers/FLUX.2-dev-bnb-4bit`, and `black-forest-labs/FLUX.2-klein-9b-fp8` remains supported when the deployment supplies its own `HF_TOKEN`/`HF_API`.
 
 `raw_vae` is a compatibility artifact derived from the decoded RGB image and mapped to channel-first `[-1, 1]`; it is not an exact VAE-internal capture.
 
@@ -35,7 +33,7 @@ nohup python3 flux_vast_min_server.py --host 0.0.0.0 --port 8910 --offload model
 curl http://HOST:8910/health
 curl -X POST http://HOST:8910/generate/enqueue \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"rainy cyberpunk street", "model_id":"dev-bfl-int8", "width":1024, "height":1024, "steps":28, "guidance_scale":5, "seed":42}'
+  -d '{"prompt":"rainy cyberpunk street", "model_id":"flux2-dev-nvfp4", "width":1024, "height":1024, "steps":28, "guidance_scale":5, "seed":42}'
 ```
 
 Then poll `/jobs/<id>` until `status` is `done` and download `/jobs/<id>/images/0`.

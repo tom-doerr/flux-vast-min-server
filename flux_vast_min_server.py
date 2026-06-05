@@ -20,23 +20,28 @@ from PIL import Image
 FLUX2_DEV_BNB = "diffusers/FLUX.2-dev-bnb-4bit"
 FLUX2_DEV_BFL = "black-forest-labs/FLUX.2-dev"
 FLUX2_DEV_BFL_INT8 = "black-forest-labs/FLUX.2-dev-int8"
+FLUX2_DEV_NVFP4 = "black-forest-labs/FLUX.2-dev-NVFP4"
 FLUX2_KLEIN_FP8 = "black-forest-labs/FLUX.2-klein-9b-fp8"
 FLUX2_KLEIN_FP8_FILE = "flux-2-klein-9b-fp8.safetensors"
 FLUX2_KLEIN_BASE = "ModelsLab/FLUX.2-klein-9B"
-DEFAULT_MODEL = FLUX2_DEV_BFL_INT8
+DEFAULT_MODEL = FLUX2_DEV_NVFP4
 MODEL_ALIASES = {
     "": DEFAULT_MODEL,
-    "dev": FLUX2_DEV_BFL_INT8,
+    "dev": FLUX2_DEV_NVFP4,
+    "dev-nvfp4": FLUX2_DEV_NVFP4,
     "dev-int8": FLUX2_DEV_BFL_INT8,
     "dev-bfl": FLUX2_DEV_BFL,
     "dev-bfl-bf16": FLUX2_DEV_BFL,
     "dev-bfl-int8": FLUX2_DEV_BFL_INT8,
+    "flux2-dev": FLUX2_DEV_NVFP4,
+    "flux2-dev-nvfp4": FLUX2_DEV_NVFP4,
     "flux2-dev-int8": FLUX2_DEV_BFL_INT8,
     "flux2-dev-bfl-int8": FLUX2_DEV_BFL_INT8,
+    "black-forest-labs/flux.2-dev-nvfp4": FLUX2_DEV_NVFP4,
     "black-forest-labs/flux.2-dev-int8": FLUX2_DEV_BFL_INT8,
+    FLUX2_DEV_NVFP4.lower(): FLUX2_DEV_NVFP4,
     FLUX2_DEV_BFL_INT8.lower(): FLUX2_DEV_BFL_INT8,
     FLUX2_DEV_BFL.lower(): FLUX2_DEV_BFL,
-    "flux2-dev": FLUX2_DEV_BFL_INT8,
     "dev-bnb": FLUX2_DEV_BNB,
     "dev-bnb-4bit": FLUX2_DEV_BNB,
     "flux2-dev-bnb": FLUX2_DEV_BNB,
@@ -280,6 +285,34 @@ class FluxRuntime:
             return self._apply_quantized_cuda(pipe)
         return self._apply_offload(pipe)
 
+    def _build_dev_nvfp4_pipe(self):
+        from diffusers import DiffusionPipeline
+
+        token = hf_token()
+        if not token:
+            raise RuntimeError(f"HF_TOKEN/HF_API is required for gated model {FLUX2_DEV_NVFP4}")
+        auth_kwargs = {"token": token}
+        device_map = "cuda" if self.device.startswith("cuda") else self.device
+        attempts = (
+            {"dtype": self._dtype_obj(), "device_map": device_map, **auth_kwargs},
+            {"torch_dtype": self._dtype_obj(), "device_map": device_map, **auth_kwargs},
+            {"dtype": self._dtype_obj(), **auth_kwargs},
+        )
+        last_exc: Exception | None = None
+        for attempt in attempts:
+            try:
+                pipe = DiffusionPipeline.from_pretrained(FLUX2_DEV_NVFP4, **attempt)
+                try:
+                    pipe.set_progress_bar_config(disable=True)
+                except Exception:
+                    pass
+                if "device_map" not in attempt and hasattr(pipe, "to"):
+                    pipe.to(self.device)
+                return pipe
+            except Exception as exc:  # pragma: no cover - depends on diffusers version
+                last_exc = exc
+        raise RuntimeError(f"Failed to build FLUX.2 dev NVFP4 pipeline: {last_exc}") from last_exc
+
     def _effective_model_id(self, model_id: str) -> str:
         if model_id == FLUX2_KLEIN_FP8 and not hf_token():
             print(f"Requested gated {FLUX2_KLEIN_FP8} without HF_TOKEN/HF_API; falling back to {FLUX2_DEV_BNB}", flush=True)
@@ -289,13 +322,15 @@ class FluxRuntime:
     def _build_pipe(self, model_id: str):
         if model_id == FLUX2_DEV_BNB:
             return self._build_dev_bnb_pipe(model_id)
+        if model_id == FLUX2_DEV_NVFP4:
+            return self._build_dev_nvfp4_pipe()
         if model_id == FLUX2_DEV_BFL_INT8:
             return self._build_dev_bfl_pipe(quantize_8bit=True)
         if model_id == FLUX2_DEV_BFL:
             return self._build_dev_bfl_pipe(quantize_8bit=False)
         if model_id == FLUX2_KLEIN_FP8:
             return self._build_klein_fp8_pipe(model_id)
-        supported = ", ".join([FLUX2_DEV_BFL_INT8, FLUX2_DEV_BFL, FLUX2_DEV_BNB, FLUX2_KLEIN_FP8])
+        supported = ", ".join([FLUX2_DEV_NVFP4, FLUX2_DEV_BFL_INT8, FLUX2_DEV_BFL, FLUX2_DEV_BNB, FLUX2_KLEIN_FP8])
         raise RuntimeError(f"Unsupported model_id {model_id!r}; supported models are {supported}")
 
     def pipe(self, model_id: str):
@@ -448,6 +483,7 @@ class Handler(BaseHTTPRequestHandler):
                 "active_model_id": runtime._model_id,
                 "loaded_model_id": runtime._model_id,
                 "known_models": [
+                    {"id": FLUX2_DEV_NVFP4, "label": "FLUX.2 dev NVFP4", "aliases": sorted(k for k, v in MODEL_ALIASES.items() if v == FLUX2_DEV_NVFP4 and k)},
                     {"id": FLUX2_DEV_BFL_INT8, "label": "FLUX.2 dev BFL 8-bit", "aliases": sorted(k for k, v in MODEL_ALIASES.items() if v == FLUX2_DEV_BFL_INT8 and k)},
                     {"id": FLUX2_DEV_BFL, "label": "FLUX.2 dev BFL BF16", "aliases": sorted(k for k, v in MODEL_ALIASES.items() if v == FLUX2_DEV_BFL and k)},
                     {"id": FLUX2_DEV_BNB, "label": "FLUX.2 dev bnb 4-bit", "aliases": sorted(k for k, v in MODEL_ALIASES.items() if v == FLUX2_DEV_BNB and k)},
