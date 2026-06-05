@@ -18,16 +18,28 @@ import numpy as np
 from PIL import Image
 
 FLUX2_DEV_BNB = "diffusers/FLUX.2-dev-bnb-4bit"
+FLUX2_DEV_BFL = "black-forest-labs/FLUX.2-dev"
+FLUX2_DEV_BFL_INT8 = "black-forest-labs/FLUX.2-dev-int8"
 FLUX2_KLEIN_FP8 = "black-forest-labs/FLUX.2-klein-9b-fp8"
 FLUX2_KLEIN_FP8_FILE = "flux-2-klein-9b-fp8.safetensors"
 FLUX2_KLEIN_BASE = "ModelsLab/FLUX.2-klein-9B"
-DEFAULT_MODEL = FLUX2_DEV_BNB
+DEFAULT_MODEL = FLUX2_DEV_BFL_INT8
 MODEL_ALIASES = {
     "": DEFAULT_MODEL,
-    "dev": FLUX2_DEV_BNB,
+    "dev": FLUX2_DEV_BFL_INT8,
+    "dev-int8": FLUX2_DEV_BFL_INT8,
+    "dev-bfl": FLUX2_DEV_BFL,
+    "dev-bfl-bf16": FLUX2_DEV_BFL,
+    "dev-bfl-int8": FLUX2_DEV_BFL_INT8,
+    "flux2-dev-int8": FLUX2_DEV_BFL_INT8,
+    "flux2-dev-bfl-int8": FLUX2_DEV_BFL_INT8,
+    "black-forest-labs/flux.2-dev-int8": FLUX2_DEV_BFL_INT8,
+    FLUX2_DEV_BFL_INT8.lower(): FLUX2_DEV_BFL_INT8,
+    FLUX2_DEV_BFL.lower(): FLUX2_DEV_BFL,
+    "flux2-dev": FLUX2_DEV_BFL_INT8,
     "dev-bnb": FLUX2_DEV_BNB,
     "dev-bnb-4bit": FLUX2_DEV_BNB,
-    "flux2-dev": FLUX2_DEV_BNB,
+    "flux2-dev-bnb": FLUX2_DEV_BNB,
     "flux2-dev-bnb-4bit": FLUX2_DEV_BNB,
     FLUX2_DEV_BNB.lower(): FLUX2_DEV_BNB,
     "klein": FLUX2_KLEIN_FP8,
@@ -207,6 +219,43 @@ class FluxRuntime:
         )
         return self._apply_offload(pipe)
 
+    def _build_dev_bfl_pipe(self, *, quantize_8bit: bool):
+        from diffusers import BitsAndBytesConfig as DiffusersBitsAndBytesConfig
+        from diffusers import Flux2Pipeline, Flux2Transformer2DModel
+        from transformers import BitsAndBytesConfig as TransformersBitsAndBytesConfig
+        from transformers import Mistral3ForConditionalGeneration
+
+        token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
+        if not token:
+            raise RuntimeError(f"HF_TOKEN is required for gated model {FLUX2_DEV_BFL}")
+        auth_kwargs = {"token": token}
+        if quantize_8bit:
+            text_encoder_kwargs = {
+                "quantization_config": TransformersBitsAndBytesConfig(load_in_8bit=True),
+                "device_map": "cpu",
+                **auth_kwargs,
+            }
+            transformer_kwargs = {
+                "quantization_config": DiffusersBitsAndBytesConfig(load_in_8bit=True),
+                "device_map": "cpu",
+                **auth_kwargs,
+            }
+        else:
+            text_encoder_kwargs = {"torch_dtype": self._dtype_obj(), "device_map": "cpu", **auth_kwargs}
+            transformer_kwargs = {"torch_dtype": self._dtype_obj(), "device_map": "cpu", **auth_kwargs}
+        text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
+            FLUX2_DEV_BFL, subfolder="text_encoder", **text_encoder_kwargs
+        )
+        transformer = Flux2Transformer2DModel.from_pretrained(FLUX2_DEV_BFL, subfolder="transformer", **transformer_kwargs)
+        pipe = Flux2Pipeline.from_pretrained(
+            FLUX2_DEV_BFL,
+            text_encoder=text_encoder,
+            transformer=transformer,
+            torch_dtype=self._dtype_obj(),
+            **auth_kwargs,
+        )
+        return self._apply_offload(pipe)
+
     def _effective_model_id(self, model_id: str) -> str:
         if model_id == FLUX2_KLEIN_FP8 and not (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")):
             print(f"Requested gated {FLUX2_KLEIN_FP8} without HF_TOKEN; falling back to {FLUX2_DEV_BNB}", flush=True)
@@ -216,11 +265,14 @@ class FluxRuntime:
     def _build_pipe(self, model_id: str):
         if model_id == FLUX2_DEV_BNB:
             return self._build_dev_bnb_pipe(model_id)
+        if model_id == FLUX2_DEV_BFL_INT8:
+            return self._build_dev_bfl_pipe(quantize_8bit=True)
+        if model_id == FLUX2_DEV_BFL:
+            return self._build_dev_bfl_pipe(quantize_8bit=False)
         if model_id == FLUX2_KLEIN_FP8:
             return self._build_klein_fp8_pipe(model_id)
-        raise RuntimeError(
-            f"Unsupported model_id {model_id!r}; supported models are {FLUX2_DEV_BNB} and {FLUX2_KLEIN_FP8}"
-        )
+        supported = ", ".join([FLUX2_DEV_BFL_INT8, FLUX2_DEV_BFL, FLUX2_DEV_BNB, FLUX2_KLEIN_FP8])
+        raise RuntimeError(f"Unsupported model_id {model_id!r}; supported models are {supported}")
 
     def pipe(self, model_id: str):
         model_id = self._effective_model_id(normalize_model_id(model_id))
@@ -367,7 +419,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"width": 1024, "height": 1024, "steps": 28, "guidance_scale": 5.0, "seed": 42, "model_id": DEFAULT_MODEL})
         if path in {"/models", "/settings/model"}:
             runtime = self.state.runtime
-            return self._json({"default_model_id": DEFAULT_MODEL, "active_model_id": runtime._model_id, "loaded_model_id": runtime._model_id, "known_models": [{"id": FLUX2_DEV_BNB, "label": "FLUX.2 dev bnb 4-bit", "aliases": sorted(k for k, v in MODEL_ALIASES.items() if v == FLUX2_DEV_BNB and k)}, {"id": FLUX2_KLEIN_FP8, "label": "FLUX.2 Klein 9B FP8", "aliases": sorted(k for k, v in MODEL_ALIASES.items() if v == FLUX2_KLEIN_FP8 and k)}]})
+            return self._json({
+                "default_model_id": DEFAULT_MODEL,
+                "active_model_id": runtime._model_id,
+                "loaded_model_id": runtime._model_id,
+                "known_models": [
+                    {"id": FLUX2_DEV_BFL_INT8, "label": "FLUX.2 dev BFL 8-bit", "aliases": sorted(k for k, v in MODEL_ALIASES.items() if v == FLUX2_DEV_BFL_INT8 and k)},
+                    {"id": FLUX2_DEV_BFL, "label": "FLUX.2 dev BFL BF16", "aliases": sorted(k for k, v in MODEL_ALIASES.items() if v == FLUX2_DEV_BFL and k)},
+                    {"id": FLUX2_DEV_BNB, "label": "FLUX.2 dev bnb 4-bit", "aliases": sorted(k for k, v in MODEL_ALIASES.items() if v == FLUX2_DEV_BNB and k)},
+                    {"id": FLUX2_KLEIN_FP8, "label": "FLUX.2 Klein 9B FP8", "aliases": sorted(k for k, v in MODEL_ALIASES.items() if v == FLUX2_KLEIN_FP8 and k)},
+                ],
+            })
         if path == "/jobs":
             query = parse_qs(parsed.query)
             limit = max(1, int((query.get("limit") or ["25"])[0]))
