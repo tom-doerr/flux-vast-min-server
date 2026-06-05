@@ -187,6 +187,17 @@ class FluxRuntime:
             pass
         return pipe
 
+    def _apply_quantized_cuda(self, pipe):
+        for name in ("vae",):
+            component = getattr(pipe, name, None)
+            if component is not None and hasattr(component, "to"):
+                component.to(self.device, dtype=self._dtype_obj())
+        try:
+            pipe.set_progress_bar_config(disable=True)
+        except Exception:
+            pass
+        return pipe
+
     def _build_klein_fp8_pipe(self, model_id: str):
         from diffusers import Flux2KleinPipeline
 
@@ -238,14 +249,15 @@ class FluxRuntime:
             raise RuntimeError(f"HF_TOKEN/HF_API is required for gated model {FLUX2_DEV_BFL}")
         auth_kwargs = {"token": token}
         if quantize_8bit:
+            device_map = "cuda" if self.device.startswith("cuda") else self.device
             text_encoder_kwargs = {
                 "quantization_config": TransformersBitsAndBytesConfig(load_in_8bit=True),
-                "device_map": "cpu",
+                "device_map": device_map,
                 **auth_kwargs,
             }
             transformer_kwargs = {
                 "quantization_config": DiffusersBitsAndBytesConfig(load_in_8bit=True),
-                "device_map": "cpu",
+                "device_map": device_map,
                 **auth_kwargs,
             }
         else:
@@ -262,6 +274,8 @@ class FluxRuntime:
             torch_dtype=self._dtype_obj(),
             **auth_kwargs,
         )
+        if quantize_8bit:
+            return self._apply_quantized_cuda(pipe)
         return self._apply_offload(pipe)
 
     def _effective_model_id(self, model_id: str) -> str:
