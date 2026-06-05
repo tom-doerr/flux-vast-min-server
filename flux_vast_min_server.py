@@ -21,6 +21,7 @@ FLUX2_DEV_BNB = "diffusers/FLUX.2-dev-bnb-4bit"
 FLUX2_DEV_BFL = "black-forest-labs/FLUX.2-dev"
 FLUX2_DEV_BFL_INT8 = "black-forest-labs/FLUX.2-dev-int8"
 FLUX2_DEV_NVFP4 = "black-forest-labs/FLUX.2-dev-NVFP4"
+FLUX2_DEV_NVFP4_FILE = "flux2-dev-nvfp4.safetensors"
 FLUX2_KLEIN_FP8 = "black-forest-labs/FLUX.2-klein-9b-fp8"
 FLUX2_KLEIN_FP8_FILE = "flux-2-klein-9b-fp8.safetensors"
 FLUX2_KLEIN_BASE = "ModelsLab/FLUX.2-klein-9B"
@@ -285,33 +286,52 @@ class FluxRuntime:
             return self._apply_quantized_cuda(pipe)
         return self._apply_offload(pipe)
 
-    def _build_dev_nvfp4_pipe(self):
-        from diffusers import DiffusionPipeline
+    def _load_dev_nvfp4_transformer(self):
+        from diffusers import Flux2Transformer2DModel
+        from huggingface_hub import hf_hub_download
 
         token = hf_token()
         if not token:
             raise RuntimeError(f"HF_TOKEN/HF_API is required for gated model {FLUX2_DEV_NVFP4}")
         auth_kwargs = {"token": token}
-        device_map = "cuda" if self.device.startswith("cuda") else self.device
+        checkpoint_path = hf_hub_download(repo_id=FLUX2_DEV_NVFP4, filename=FLUX2_DEV_NVFP4_FILE, **auth_kwargs)
         attempts = (
-            {"dtype": self._dtype_obj(), "device_map": device_map, **auth_kwargs},
-            {"torch_dtype": self._dtype_obj(), "device_map": device_map, **auth_kwargs},
-            {"dtype": self._dtype_obj(), **auth_kwargs},
+            {"config": FLUX2_DEV_BFL, "subfolder": "transformer", "torch_dtype": self._dtype_obj(), **auth_kwargs},
+            {"config": FLUX2_DEV_BFL, "subfolder": "transformer", "dtype": self._dtype_obj(), **auth_kwargs},
+            {"config": FLUX2_DEV_BFL, "subfolder": "transformer", **auth_kwargs},
         )
         last_exc: Exception | None = None
         for attempt in attempts:
             try:
-                pipe = DiffusionPipeline.from_pretrained(FLUX2_DEV_NVFP4, **attempt)
-                try:
-                    pipe.set_progress_bar_config(disable=True)
-                except Exception:
-                    pass
-                if "device_map" not in attempt and hasattr(pipe, "to"):
-                    pipe.to(self.device)
-                return pipe
+                return Flux2Transformer2DModel.from_single_file(checkpoint_path, **attempt)
             except Exception as exc:  # pragma: no cover - depends on diffusers version
                 last_exc = exc
-        raise RuntimeError(f"Failed to build FLUX.2 dev NVFP4 pipeline: {last_exc}") from last_exc
+        raise RuntimeError(f"Failed to load FLUX.2 dev NVFP4 transformer: {last_exc}") from last_exc
+
+    def _build_dev_nvfp4_pipe(self):
+        from diffusers import Flux2Pipeline
+        from transformers import Mistral3ForConditionalGeneration
+
+        token = hf_token()
+        if not token:
+            raise RuntimeError(f"HF_TOKEN/HF_API is required for gated model {FLUX2_DEV_NVFP4}")
+        auth_kwargs = {"token": token}
+        text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
+            FLUX2_DEV_BFL,
+            subfolder="text_encoder",
+            torch_dtype=self._dtype_obj(),
+            device_map="cpu",
+            **auth_kwargs,
+        )
+        transformer = self._load_dev_nvfp4_transformer()
+        pipe = Flux2Pipeline.from_pretrained(
+            FLUX2_DEV_BFL,
+            text_encoder=text_encoder,
+            transformer=transformer,
+            torch_dtype=self._dtype_obj(),
+            **auth_kwargs,
+        )
+        return self._apply_offload(pipe)
 
     def _effective_model_id(self, model_id: str) -> str:
         if model_id == FLUX2_KLEIN_FP8 and not hf_token():
