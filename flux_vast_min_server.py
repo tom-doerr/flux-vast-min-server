@@ -25,16 +25,16 @@ FLUX2_DEV_NVFP4_FILE = "flux2-dev-nvfp4.safetensors"
 FLUX2_KLEIN_FP8 = "black-forest-labs/FLUX.2-klein-9b-fp8"
 FLUX2_KLEIN_FP8_FILE = "flux-2-klein-9b-fp8.safetensors"
 FLUX2_KLEIN_BASE = "ModelsLab/FLUX.2-klein-9B"
-DEFAULT_MODEL = FLUX2_DEV_NVFP4
+DEFAULT_MODEL = FLUX2_DEV_BNB
 MODEL_ALIASES = {
     "": DEFAULT_MODEL,
-    "dev": FLUX2_DEV_NVFP4,
+    "dev": FLUX2_DEV_BNB,
     "dev-nvfp4": FLUX2_DEV_NVFP4,
     "dev-int8": FLUX2_DEV_BFL_INT8,
     "dev-bfl": FLUX2_DEV_BFL,
     "dev-bfl-bf16": FLUX2_DEV_BFL,
     "dev-bfl-int8": FLUX2_DEV_BFL_INT8,
-    "flux2-dev": FLUX2_DEV_NVFP4,
+    "flux2-dev": FLUX2_DEV_BNB,
     "flux2-dev-nvfp4": FLUX2_DEV_NVFP4,
     "flux2-dev-int8": FLUX2_DEV_BFL_INT8,
     "flux2-dev-bfl-int8": FLUX2_DEV_BFL_INT8,
