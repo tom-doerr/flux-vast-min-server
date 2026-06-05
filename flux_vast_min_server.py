@@ -57,6 +57,14 @@ def normalize_model_id(value: object) -> str:
     return MODEL_ALIASES.get(raw.lower(), raw or DEFAULT_MODEL)
 
 
+def hf_token() -> str | None:
+    for name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HF_API", "HF_READ_GATED_API_TOKEN"):
+        token = os.environ.get(name)
+        if token:
+            return token
+    return None
+
+
 def json_safe_job(job: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in job.items() if k not in {"traceback"}}
 
@@ -141,7 +149,7 @@ class FluxRuntime:
         from huggingface_hub import hf_hub_download
         from safetensors.torch import load_file
 
-        token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
+        token = hf_token()
         kwargs = {"token": token} if token else {}
         checkpoint_path = hf_hub_download(repo_id=model_id, filename=FLUX2_KLEIN_FP8_FILE, **kwargs)
         state = load_file(checkpoint_path)
@@ -182,7 +190,7 @@ class FluxRuntime:
     def _build_klein_fp8_pipe(self, model_id: str):
         from diffusers import Flux2KleinPipeline
 
-        token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
+        token = hf_token()
         kwargs = {"token": token} if token else {}
         transformer = self._load_transformer(model_id)
         attempts = (
@@ -205,7 +213,7 @@ class FluxRuntime:
         from diffusers import AutoModel, Flux2Pipeline
         from transformers import Mistral3ForConditionalGeneration
 
-        token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
+        token = hf_token()
         auth_kwargs = {"token": token} if token else {}
         common = {"torch_dtype": self._dtype_obj(), "device_map": "cpu", **auth_kwargs}
         text_encoder = Mistral3ForConditionalGeneration.from_pretrained(model_id, subfolder="text_encoder", **common)
@@ -225,9 +233,9 @@ class FluxRuntime:
         from transformers import BitsAndBytesConfig as TransformersBitsAndBytesConfig
         from transformers import Mistral3ForConditionalGeneration
 
-        token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
+        token = hf_token()
         if not token:
-            raise RuntimeError(f"HF_TOKEN is required for gated model {FLUX2_DEV_BFL}")
+            raise RuntimeError(f"HF_TOKEN/HF_API is required for gated model {FLUX2_DEV_BFL}")
         auth_kwargs = {"token": token}
         if quantize_8bit:
             text_encoder_kwargs = {

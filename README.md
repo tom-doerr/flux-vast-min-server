@@ -14,7 +14,7 @@ It implements the subset of the local image-generation API used by Idea Rank:
 - `GET /jobs/<job_id>/images/<index>/decoded`
 - `GET /jobs/<job_id>/images/<index>/raw_vae`
 
-The default model is `black-forest-labs/FLUX.2-dev-int8`, a server-side alias that loads the gated BFL `black-forest-labs/FLUX.2-dev` weights with bitsandbytes 8-bit quantization for the text encoder and transformer. It requires `HF_TOKEN` on the deployment host. The public `diffusers/FLUX.2-dev-bnb-4bit` fallback remains available as `dev-bnb-4bit`; `black-forest-labs/FLUX.2-klein-9b-fp8` remains supported when the deployment supplies its own `HF_TOKEN`.
+The default model is `black-forest-labs/FLUX.2-dev-int8`, a server-side alias that loads the gated BFL `black-forest-labs/FLUX.2-dev` weights with bitsandbytes 8-bit quantization for the text encoder and transformer. It requires `HF_TOKEN` or `HF_API` on the deployment host. The public `diffusers/FLUX.2-dev-bnb-4bit` fallback remains available as `dev-bnb-4bit`; `black-forest-labs/FLUX.2-klein-9b-fp8` remains supported when the deployment supplies its own `HF_TOKEN`/`HF_API`.
 
 BFL also publishes `black-forest-labs/FLUX.2-dev-NVFP4`, but this server does not default to it on H200 because NVFP4 is aimed at native FP4-capable Blackwell hardware, not Hopper/H200.
 
