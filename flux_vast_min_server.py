@@ -207,6 +207,12 @@ class FluxRuntime:
         )
         return self._apply_offload(pipe)
 
+    def _effective_model_id(self, model_id: str) -> str:
+        if model_id == FLUX2_KLEIN_FP8 and not (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")):
+            print(f"Requested gated {FLUX2_KLEIN_FP8} without HF_TOKEN; falling back to {FLUX2_DEV_BNB}", flush=True)
+            return FLUX2_DEV_BNB
+        return model_id
+
     def _build_pipe(self, model_id: str):
         if model_id == FLUX2_DEV_BNB:
             return self._build_dev_bnb_pipe(model_id)
@@ -217,7 +223,7 @@ class FluxRuntime:
         )
 
     def pipe(self, model_id: str):
-        model_id = normalize_model_id(model_id)
+        model_id = self._effective_model_id(normalize_model_id(model_id))
         with self._lock:
             if self._pipe is None or self._model_id != model_id:
                 self._pipe = self._build_pipe(model_id)

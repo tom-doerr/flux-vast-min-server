@@ -14,7 +14,7 @@ It implements the subset of the local image-generation API used by Idea Rank:
 - `GET /jobs/<job_id>/images/<index>/decoded`
 - `GET /jobs/<job_id>/images/<index>/raw_vae`
 
-The default model is `diffusers/FLUX.2-dev-bnb-4bit`, which is usable without copying a Hugging Face token to the Vast host. `black-forest-labs/FLUX.2-klein-9b-fp8` remains supported when the deployment supplies its own `HF_TOKEN`.
+The default model is `diffusers/FLUX.2-dev-bnb-4bit`, which is usable without copying a Hugging Face token to the Vast host. `black-forest-labs/FLUX.2-klein-9b-fp8` remains supported when the deployment supplies its own `HF_TOKEN`; without a token, Klein requests fall back to the public dev-bnb model.
 
 `raw_vae` is a compatibility artifact derived from the decoded RGB image and mapped to channel-first `[-1, 1]`; it is not an exact VAE-internal capture.
 
