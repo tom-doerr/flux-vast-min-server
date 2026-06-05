@@ -14,7 +14,7 @@ It implements the subset of the local image-generation API used by Idea Rank:
 - `GET /jobs/<job_id>/images/<index>/decoded`
 - `GET /jobs/<job_id>/images/<index>/raw_vae`
 
-The default model is `black-forest-labs/FLUX.2-klein-9b-fp8` with components from `ModelsLab/FLUX.2-klein-9B`.
+The default model is `diffusers/FLUX.2-dev-bnb-4bit`, which is usable without copying a Hugging Face token to the Vast host. `black-forest-labs/FLUX.2-klein-9b-fp8` remains supported when the deployment supplies its own `HF_TOKEN`.
 
 `raw_vae` is a compatibility artifact derived from the decoded RGB image and mapped to channel-first `[-1, 1]`; it is not an exact VAE-internal capture.
 
@@ -33,7 +33,7 @@ nohup python3 flux_vast_min_server.py --host 0.0.0.0 --port 8910 --offload model
 curl http://HOST:8910/health
 curl -X POST http://HOST:8910/generate/enqueue \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"rainy cyberpunk street", "width":1024, "height":1024, "steps":28, "guidance_scale":5, "seed":42}'
+  -d '{"prompt":"rainy cyberpunk street", "model_id":"diffusers/FLUX.2-dev-bnb-4bit", "width":1024, "height":1024, "steps":28, "guidance_scale":5, "seed":42}'
 ```
 
 Then poll `/jobs/<id>` until `status` is `done` and download `/jobs/<id>/images/0`.

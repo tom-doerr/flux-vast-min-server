@@ -17,11 +17,19 @@ from urllib.parse import parse_qs, urlparse
 import numpy as np
 from PIL import Image
 
+FLUX2_DEV_BNB = "diffusers/FLUX.2-dev-bnb-4bit"
 FLUX2_KLEIN_FP8 = "black-forest-labs/FLUX.2-klein-9b-fp8"
 FLUX2_KLEIN_FP8_FILE = "flux-2-klein-9b-fp8.safetensors"
 FLUX2_KLEIN_BASE = "ModelsLab/FLUX.2-klein-9B"
+DEFAULT_MODEL = FLUX2_DEV_BNB
 MODEL_ALIASES = {
-    "": FLUX2_KLEIN_FP8,
+    "": DEFAULT_MODEL,
+    "dev": FLUX2_DEV_BNB,
+    "dev-bnb": FLUX2_DEV_BNB,
+    "dev-bnb-4bit": FLUX2_DEV_BNB,
+    "flux2-dev": FLUX2_DEV_BNB,
+    "flux2-dev-bnb-4bit": FLUX2_DEV_BNB,
+    FLUX2_DEV_BNB.lower(): FLUX2_DEV_BNB,
     "klein": FLUX2_KLEIN_FP8,
     "klein-fp8": FLUX2_KLEIN_FP8,
     "klein-9b-fp8": FLUX2_KLEIN_FP8,
@@ -34,7 +42,7 @@ MODEL_ALIASES = {
 
 def normalize_model_id(value: object) -> str:
     raw = str(value or "").strip()
-    return MODEL_ALIASES.get(raw.lower(), raw or FLUX2_KLEIN_FP8)
+    return MODEL_ALIASES.get(raw.lower(), raw or DEFAULT_MODEL)
 
 
 def json_safe_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -145,7 +153,21 @@ class FluxRuntime:
                 last_exc = exc
         raise RuntimeError(f"Failed to load transformer from {model_id}: {last_exc}") from last_exc
 
-    def _build_pipe(self, model_id: str):
+    def _apply_offload(self, pipe):
+        mode = self.offload.lower().replace("-", "_")
+        if mode in {"model", "model_cpu", "cpu"} and hasattr(pipe, "enable_model_cpu_offload"):
+            pipe.enable_model_cpu_offload()
+        elif mode in {"sequential", "sequential_cpu"} and hasattr(pipe, "enable_sequential_cpu_offload"):
+            pipe.enable_sequential_cpu_offload()
+        else:
+            pipe.to(self.device)
+        try:
+            pipe.set_progress_bar_config(disable=True)
+        except Exception:
+            pass
+        return pipe
+
+    def _build_klein_fp8_pipe(self, model_id: str):
         from diffusers import Flux2KleinPipeline
 
         token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
@@ -165,24 +187,37 @@ class FluxRuntime:
                 last_exc = exc
         else:
             raise RuntimeError(f"Failed to build FLUX.2 Klein pipeline: {last_exc}") from last_exc
+        return self._apply_offload(pipe)
 
-        mode = self.offload.lower().replace("-", "_")
-        if mode in {"model", "model_cpu", "cpu"} and hasattr(pipe, "enable_model_cpu_offload"):
-            pipe.enable_model_cpu_offload()
-        elif mode in {"sequential", "sequential_cpu"} and hasattr(pipe, "enable_sequential_cpu_offload"):
-            pipe.enable_sequential_cpu_offload()
-        else:
-            pipe.to(self.device)
-        try:
-            pipe.set_progress_bar_config(disable=True)
-        except Exception:
-            pass
-        return pipe
+    def _build_dev_bnb_pipe(self, model_id: str):
+        from diffusers import AutoModel, Flux2Pipeline
+        from transformers import Mistral3ForConditionalGeneration
+
+        token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
+        auth_kwargs = {"token": token} if token else {}
+        common = {"torch_dtype": self._dtype_obj(), "device_map": "cpu", **auth_kwargs}
+        text_encoder = Mistral3ForConditionalGeneration.from_pretrained(model_id, subfolder="text_encoder", **common)
+        transformer = AutoModel.from_pretrained(model_id, subfolder="transformer", **common)
+        pipe = Flux2Pipeline.from_pretrained(
+            model_id,
+            text_encoder=text_encoder,
+            transformer=transformer,
+            torch_dtype=self._dtype_obj(),
+            **auth_kwargs,
+        )
+        return self._apply_offload(pipe)
+
+    def _build_pipe(self, model_id: str):
+        if model_id == FLUX2_DEV_BNB:
+            return self._build_dev_bnb_pipe(model_id)
+        if model_id == FLUX2_KLEIN_FP8:
+            return self._build_klein_fp8_pipe(model_id)
+        raise RuntimeError(
+            f"Unsupported model_id {model_id!r}; supported models are {FLUX2_DEV_BNB} and {FLUX2_KLEIN_FP8}"
+        )
 
     def pipe(self, model_id: str):
         model_id = normalize_model_id(model_id)
-        if model_id != FLUX2_KLEIN_FP8:
-            raise RuntimeError(f"Unsupported model_id {model_id!r}; this server supports {FLUX2_KLEIN_FP8}")
         with self._lock:
             if self._pipe is None or self._model_id != model_id:
                 self._pipe = self._build_pipe(model_id)
@@ -323,10 +358,10 @@ class Handler(BaseHTTPRequestHandler):
             runtime = self.state.runtime
             return self._json({"ok": True, "loaded": runtime._pipe is not None, "model": runtime._model_id, "jobs": len(self.state.jobs), "queue_size": self.state.queue.qsize()})
         if path == "/generate/params":
-            return self._json({"width": 1024, "height": 1024, "steps": 28, "guidance_scale": 5.0, "seed": 42, "model_id": FLUX2_KLEIN_FP8})
+            return self._json({"width": 1024, "height": 1024, "steps": 28, "guidance_scale": 5.0, "seed": 42, "model_id": DEFAULT_MODEL})
         if path in {"/models", "/settings/model"}:
             runtime = self.state.runtime
-            return self._json({"default_model_id": FLUX2_KLEIN_FP8, "active_model_id": runtime._model_id, "loaded_model_id": runtime._model_id, "known_models": [{"id": FLUX2_KLEIN_FP8, "label": "FLUX.2 Klein 9B FP8", "aliases": sorted(k for k, v in MODEL_ALIASES.items() if v == FLUX2_KLEIN_FP8 and k)}]})
+            return self._json({"default_model_id": DEFAULT_MODEL, "active_model_id": runtime._model_id, "loaded_model_id": runtime._model_id, "known_models": [{"id": FLUX2_DEV_BNB, "label": "FLUX.2 dev bnb 4-bit", "aliases": sorted(k for k, v in MODEL_ALIASES.items() if v == FLUX2_DEV_BNB and k)}, {"id": FLUX2_KLEIN_FP8, "label": "FLUX.2 Klein 9B FP8", "aliases": sorted(k for k, v in MODEL_ALIASES.items() if v == FLUX2_KLEIN_FP8 and k)}]})
         if path == "/jobs":
             query = parse_qs(parsed.query)
             limit = max(1, int((query.get("limit") or ["25"])[0]))
@@ -377,7 +412,7 @@ class Handler(BaseHTTPRequestHandler):
             job = self.state.enqueue(payload)
             return self._json({"id": job.id, "status": job.status})
         if path == "/settings/model":
-            return self._json({"default_model_id": FLUX2_KLEIN_FP8, "active_model_id": self.state.runtime._model_id, "loaded_model_id": self.state.runtime._model_id})
+            return self._json({"default_model_id": DEFAULT_MODEL, "active_model_id": self.state.runtime._model_id, "loaded_model_id": self.state.runtime._model_id})
         return self._json({"error": "not found"}, 404)
 
 
