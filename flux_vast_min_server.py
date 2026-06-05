@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import queue
+import subprocess
 import threading
 import time
 import traceback
@@ -129,6 +130,53 @@ def _is_oom_error(exc: BaseException) -> bool:
         or "cuda oom" in text
         or "cudaerror" in text and "memory" in text
     )
+
+
+def gpu_status() -> dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.used,memory.total,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+    except Exception as exc:
+        return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
+    if proc.returncode != 0:
+        return {"available": False, "error": (proc.stderr or proc.stdout or "nvidia-smi failed").strip()}
+    gpus = []
+    for line in proc.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 4:
+            continue
+        name, used, total, util = parts[:4]
+        try:
+            used_mib = float(used)
+            total_mib = float(total)
+            util_pct = float(util)
+        except ValueError:
+            continue
+        gpus.append({
+            "name": name,
+            "memory_used_mib": used_mib,
+            "memory_total_mib": total_mib,
+            "memory_used_fraction": used_mib / total_mib if total_mib > 0 else None,
+            "utilization_gpu_percent": util_pct,
+        })
+    used_sum = sum(gpu["memory_used_mib"] for gpu in gpus)
+    total_sum = sum(gpu["memory_total_mib"] for gpu in gpus)
+    return {
+        "available": bool(gpus),
+        "gpus": gpus,
+        "memory_used_mib": used_sum,
+        "memory_total_mib": total_sum,
+        "memory_used_fraction": used_sum / total_sum if total_sum > 0 else None,
+    }
 
 
 def _clear_cuda_cache() -> None:
@@ -535,6 +583,28 @@ class AppState:
         with self.lock:
             return {"max_batch_size": self.max_batch_size, "batch_wait_ms": self.batch_wait_ms}
 
+    def status(self) -> dict[str, Any]:
+        with self.lock:
+            jobs = list(self.jobs.values())
+            batch = self.batch_config()
+            queue_size = self.queue.qsize()
+        running = [job for job in jobs if job.status == "running"]
+        latest_batch_job = max(
+            (job for job in jobs if job.batch_id is not None),
+            key=lambda job: (job.batch_id or 0, job.started_at or 0.0),
+            default=None,
+        )
+        return {
+            "jobs": len(jobs),
+            "queue_size": queue_size,
+            "running_jobs": len(running),
+            "running_batch_size": max((job.batch_size or 1 for job in running), default=0),
+            "last_batch_id": latest_batch_job.batch_id if latest_batch_job else None,
+            "last_batch_size": latest_batch_job.batch_size if latest_batch_job else None,
+            "last_batch_status": latest_batch_job.status if latest_batch_job else None,
+            "batch": batch,
+        }
+
     def update_batch_config(self, payload: dict[str, Any]) -> dict[str, int]:
         with self.lock:
             if "max_batch_size" in payload:
@@ -676,13 +746,13 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
         if path == "/health":
             runtime = self.state.runtime
+            status = self.state.status()
             return self._json({
                 "ok": True,
                 "loaded": runtime._pipe is not None,
                 "model": runtime._model_id,
-                "jobs": len(self.state.jobs),
-                "queue_size": self.state.queue.qsize(),
-                "batch": self.state.batch_config(),
+                **status,
+                "gpu": gpu_status(),
             })
         if path == "/generate/params":
             return self._json({"width": 1024, "height": 1024, "steps": 28, "guidance_scale": 5.0, "seed": 42, "model_id": DEFAULT_MODEL, **self.state.batch_config()})
