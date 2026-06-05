@@ -7,6 +7,8 @@ It implements the subset of the local image-generation API used by Idea Rank:
 - `GET /health`
 - `GET /generate/params`
 - `POST /generate/enqueue`
+- `GET /batch/config`
+- `POST /batch/config`
 - `GET /jobs`
 - `GET /jobs/<job_id>`
 - `GET /jobs/<job_id>/images`
@@ -24,7 +26,7 @@ The default model is `diffusers/FLUX.2-dev-bnb-4bit`, the supported public Diffu
 git clone https://github.com/tom-doerr/flux-vast-min-server.git /workspace/flux-vast-min-server
 cd /workspace/flux-vast-min-server
 python3 -m pip install --no-cache-dir -r requirements.txt
-nohup python3 flux_vast_min_server.py --host 0.0.0.0 --port 8910 --offload model > /workspace/logs/flux.log 2>&1 &
+nohup python3 flux_vast_min_server.py --host 0.0.0.0 --port 8910 --offload model --max-batch-size 2 --batch-wait-ms 1000 > /workspace/logs/flux.log 2>&1 &
 ```
 
 ## Test
@@ -37,6 +39,15 @@ curl -X POST http://HOST:8910/generate/enqueue \
 ```
 
 Then poll `/jobs/<id>` until `status` is `done` and download `/jobs/<id>/images/0`.
+
+Dynamic batching is server-side. Clients can keep enqueuing one image per job; compatible queued jobs are coalesced up to `max_batch_size` within `batch_wait_ms`. The runtime settings can be changed without restart:
+
+```bash
+curl http://HOST:8910/batch/config
+curl -X POST http://HOST:8910/batch/config \
+  -H 'Content-Type: application/json' \
+  -d '{"max_batch_size":2, "batch_wait_ms":1000}'
+```
 
 ## Docker
 

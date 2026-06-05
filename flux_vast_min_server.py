@@ -26,6 +26,8 @@ FLUX2_KLEIN_FP8 = "black-forest-labs/FLUX.2-klein-9b-fp8"
 FLUX2_KLEIN_FP8_FILE = "flux-2-klein-9b-fp8.safetensors"
 FLUX2_KLEIN_BASE = "ModelsLab/FLUX.2-klein-9B"
 DEFAULT_MODEL = FLUX2_DEV_BNB
+DEFAULT_MAX_BATCH_SIZE = 2
+DEFAULT_BATCH_WAIT_MS = 1000
 MODEL_ALIASES = {
     "": DEFAULT_MODEL,
     "dev": FLUX2_DEV_BNB,
@@ -81,6 +83,68 @@ def image_arrays(image: Image.Image) -> tuple[np.ndarray, np.ndarray]:
     return decoded.astype(np.float32), raw_vae_compat
 
 
+def _json_key(value: Any) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    except TypeError:
+        return repr(value)
+
+
+def _pipeline_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
+    value = payload.get("pipeline_kwargs")
+    return value if isinstance(value, dict) else {}
+
+
+def _job_batch_spec(job: "Job") -> tuple[Any, ...]:
+    payload = job.payload
+    return (
+        normalize_model_id(payload.get("model_id")),
+        int(payload.get("width") or 1024),
+        int(payload.get("height") or 1024),
+        int(payload.get("num_inference_steps") or payload.get("steps") or 28),
+        float(payload.get("guidance_scale") or payload.get("guidance") or 5.0),
+        str(payload.get("negative_prompt") or ""),
+        _json_key(_pipeline_kwargs(payload)),
+    )
+
+
+def _single_image_job(job: "Job") -> bool:
+    payload = job.payload
+    try:
+        num_images = int(payload.get("num_images") or 1)
+        batch_size = int(payload.get("batch_size") or 1)
+    except (TypeError, ValueError):
+        return False
+    return num_images == 1 and batch_size == 1
+
+
+def _jobs_compatible(first: "Job", other: "Job") -> bool:
+    return _single_image_job(first) and _single_image_job(other) and _job_batch_spec(first) == _job_batch_spec(other)
+
+
+def _is_oom_error(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return (
+        "out of memory" in text
+        or "cuda oom" in text
+        or "cudaerror" in text and "memory" in text
+    )
+
+
+def _clear_cuda_cache() -> None:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 @dataclass
 class ImageRecord:
     index: int
@@ -114,6 +178,8 @@ class Job:
     error: str | None = None
     traceback: str | None = None
     images: list[ImageRecord] = field(default_factory=list)
+    batch_id: int | None = None
+    batch_size: int | None = None
 
     def payload_dict(self) -> dict[str, Any]:
         return {
@@ -124,6 +190,8 @@ class Job:
             "finished_at": self.finished_at,
             "error": self.error,
             "images": [image.payload(self.id) for image in self.images],
+            "batch_id": self.batch_id,
+            "batch_size": self.batch_size,
             "payload": self.payload,
         }
 
@@ -358,42 +426,9 @@ class FluxRuntime:
                 self._model_id = model_id
             return self._pipe
 
-    def generate(self, job: Job) -> None:
-        import torch
-
-        payload = job.payload
-        prompt = str(payload.get("prompt") or "").strip()
-        if not prompt:
-            raise RuntimeError("prompt is required")
-        width = int(payload.get("width") or 1024)
-        height = int(payload.get("height") or 1024)
-        steps = int(payload.get("num_inference_steps") or payload.get("steps") or 28)
-        guidance_scale = float(payload.get("guidance_scale") or payload.get("guidance") or 5.0)
-        seed = int(payload.get("seed") if payload.get("seed") is not None else 42)
-        model_id = normalize_model_id(payload.get("model_id"))
-        pipeline_kwargs = payload.get("pipeline_kwargs") if isinstance(payload.get("pipeline_kwargs"), dict) else {}
-
-        pipe = self.pipe(model_id)
-        generator_device = "cuda" if torch.cuda.is_available() and self.device.startswith("cuda") else "cpu"
-        generator = torch.Generator(device=generator_device).manual_seed(seed)
-        call_kwargs = {
-            "prompt": prompt,
-            "width": width,
-            "height": height,
-            "num_inference_steps": steps,
-            "guidance_scale": guidance_scale,
-            "generator": generator,
-            **pipeline_kwargs,
-        }
-        if payload.get("negative_prompt"):
-            call_kwargs["negative_prompt"] = str(payload["negative_prompt"])
-
-        with self._generate_lock:
-            result = pipe(**call_kwargs)
-        images = list(result.images)
+    def _write_job_images(self, job: Job, images: list[Image.Image]) -> None:
         if not images:
             raise RuntimeError("pipeline returned no images")
-
         job_dir = self.output_dir / str(job.id)
         job_dir.mkdir(parents=True, exist_ok=True)
         records: list[ImageRecord] = []
@@ -406,17 +441,77 @@ class FluxRuntime:
             decoded, raw_vae = image_arrays(image)
             np.savez_compressed(decoded_path, decoded=decoded)
             np.savez_compressed(raw_vae_path, raw_vae=raw_vae)
-            records.append(ImageRecord(index=index, path=png_path, decoded_path=decoded_path, raw_vae_path=raw_vae_path, width=image.width, height=image.height))
+            records.append(
+                ImageRecord(
+                    index=index,
+                    path=png_path,
+                    decoded_path=decoded_path,
+                    raw_vae_path=raw_vae_path,
+                    width=image.width,
+                    height=image.height,
+                )
+            )
         job.images = records
 
+    def generate_batch(self, jobs: list[Job]) -> None:
+        import torch
+
+        jobs = list(jobs)
+        if not jobs:
+            return
+        if any(not _jobs_compatible(jobs[0], job) for job in jobs[1:]):
+            raise RuntimeError("cannot batch jobs with different generation parameters")
+
+        first = jobs[0].payload
+        prompts = [str(job.payload.get("prompt") or "").strip() for job in jobs]
+        if any(not prompt for prompt in prompts):
+            raise RuntimeError("prompt is required")
+        width = int(first.get("width") or 1024)
+        height = int(first.get("height") or 1024)
+        steps = int(first.get("num_inference_steps") or first.get("steps") or 28)
+        guidance_scale = float(first.get("guidance_scale") or first.get("guidance") or 5.0)
+        model_id = normalize_model_id(first.get("model_id"))
+        pipeline_kwargs = _pipeline_kwargs(first)
+
+        pipe = self.pipe(model_id)
+        generator_device = "cuda" if torch.cuda.is_available() and self.device.startswith("cuda") else "cpu"
+        seeds = [int(job.payload.get("seed") if job.payload.get("seed") is not None else 42) for job in jobs]
+        generators = [torch.Generator(device=generator_device).manual_seed(seed) for seed in seeds]
+        multi = len(jobs) > 1
+        call_kwargs = {
+            "prompt": prompts if multi else prompts[0],
+            "width": width,
+            "height": height,
+            "num_inference_steps": steps,
+            "guidance_scale": guidance_scale,
+            "generator": generators if multi else generators[0],
+            **pipeline_kwargs,
+        }
+        if first.get("negative_prompt"):
+            negative_prompt = str(first["negative_prompt"])
+            call_kwargs["negative_prompt"] = [negative_prompt] * len(jobs) if multi else negative_prompt
+
+        with self._generate_lock:
+            result = pipe(**call_kwargs)
+        images = list(result.images)
+        if len(images) != len(jobs):
+            raise RuntimeError(f"pipeline returned {len(images)} images for {len(jobs)} batched prompts")
+        for job, image in zip(jobs, images):
+            self._write_job_images(job, [image])
+
+    def generate(self, job: Job) -> None:
+        self.generate_batch([job])
 
 class AppState:
-    def __init__(self, runtime: FluxRuntime) -> None:
+    def __init__(self, runtime: FluxRuntime, *, max_batch_size: int = DEFAULT_MAX_BATCH_SIZE, batch_wait_ms: int = DEFAULT_BATCH_WAIT_MS) -> None:
         self.runtime = runtime
         self.lock = threading.RLock()
         self.jobs: dict[int, Job] = {}
         self.next_job_id = 1
         self.queue: queue.Queue[int] = queue.Queue()
+        self.max_batch_size = max(1, int(max_batch_size))
+        self.batch_wait_ms = max(0, int(batch_wait_ms))
+        self.next_batch_id = 1
         self.worker = threading.Thread(target=self._worker, daemon=True)
         self.worker.start()
 
@@ -436,26 +531,117 @@ class AppState:
         with self.lock:
             return sorted(self.jobs.values(), key=lambda job: job.id, reverse=True)[:limit]
 
+    def batch_config(self) -> dict[str, int]:
+        with self.lock:
+            return {"max_batch_size": self.max_batch_size, "batch_wait_ms": self.batch_wait_ms}
+
+    def update_batch_config(self, payload: dict[str, Any]) -> dict[str, int]:
+        with self.lock:
+            if "max_batch_size" in payload:
+                self.max_batch_size = max(1, int(payload["max_batch_size"]))
+            if "batch_wait_ms" in payload:
+                self.batch_wait_ms = max(0, int(payload["batch_wait_ms"]))
+            return {"max_batch_size": self.max_batch_size, "batch_wait_ms": self.batch_wait_ms}
+
+    def _next_batch(self) -> int:
+        with self.lock:
+            batch_id = self.next_batch_id
+            self.next_batch_id += 1
+            return batch_id
+
+    def _collect_batch(self, first: Job) -> list[Job]:
+        with self.lock:
+            max_batch_size = self.max_batch_size
+            batch_wait_ms = self.batch_wait_ms
+        jobs = [first]
+        if max_batch_size <= 1 or batch_wait_ms <= 0 or not _single_image_job(first):
+            return jobs
+        deadline = time.time() + batch_wait_ms / 1000.0
+        while len(jobs) < max_batch_size:
+            timeout = deadline - time.time()
+            if timeout <= 0:
+                break
+            try:
+                job_id = self.queue.get(timeout=timeout)
+            except queue.Empty:
+                break
+            job = self.get(job_id)
+            if job is None:
+                self.queue.task_done()
+                continue
+            if _jobs_compatible(first, job):
+                jobs.append(job)
+                continue
+            self.queue.put(job_id)
+            self.queue.task_done()
+            break
+        return jobs
+
+    def _mark_running(self, jobs: list[Job], batch_id: int) -> None:
+        now = time.time()
+        for job in jobs:
+            job.status = "running"
+            job.started_at = now
+            job.finished_at = None
+            job.error = None
+            job.traceback = None
+            job.batch_id = batch_id
+            job.batch_size = len(jobs)
+
+    def _mark_done(self, jobs: list[Job]) -> None:
+        now = time.time()
+        for job in jobs:
+            job.status = "done"
+            job.finished_at = now
+
+    def _mark_error(self, jobs: list[Job], exc: BaseException) -> None:
+        tb = traceback.format_exc()
+        now = time.time()
+        for job in jobs:
+            job.status = "error"
+            job.error = f"{type(exc).__name__}: {exc}"
+            job.traceback = tb
+            job.finished_at = now
+        print(tb, flush=True)
+
+    def _run_single(self, job: Job) -> None:
+        batch_id = self._next_batch()
+        self._mark_running([job], batch_id)
+        try:
+            self.runtime.generate(job)
+            self._mark_done([job])
+        except Exception as exc:
+            self._mark_error([job], exc)
+
+    def _run_batch(self, jobs: list[Job]) -> None:
+        batch_id = self._next_batch()
+        self._mark_running(jobs, batch_id)
+        try:
+            self.runtime.generate_batch(jobs)
+            self._mark_done(jobs)
+        except Exception as exc:
+            if len(jobs) > 1 and _is_oom_error(exc):
+                print(f"batch {batch_id} hit OOM at size {len(jobs)}; retrying as single jobs", flush=True)
+                _clear_cuda_cache()
+                for job in jobs:
+                    self._run_single(job)
+                return
+            self._mark_error(jobs, exc)
+
     def _worker(self) -> None:
         while True:
             job_id = self.queue.get()
-            job = self.get(job_id)
-            if job is None:
-                continue
-            job.status = "running"
-            job.started_at = time.time()
+            ack_count = 1
             try:
-                self.runtime.generate(job)
-                job.status = "done"
-            except Exception as exc:
-                job.status = "error"
-                job.error = f"{type(exc).__name__}: {exc}"
-                job.traceback = traceback.format_exc()
-                print(job.traceback, flush=True)
+                job = self.get(job_id)
+                if job is None:
+                    continue
+                jobs = self._collect_batch(job)
+                ack_count = len(jobs)
+                self._run_batch(jobs)
             finally:
-                job.finished_at = time.time()
-                self.queue.task_done()
-
+                for _ in range(ack_count):
+                    self.queue.task_done()
 
 STATE: AppState | None = None
 
@@ -490,9 +676,18 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
         if path == "/health":
             runtime = self.state.runtime
-            return self._json({"ok": True, "loaded": runtime._pipe is not None, "model": runtime._model_id, "jobs": len(self.state.jobs), "queue_size": self.state.queue.qsize()})
+            return self._json({
+                "ok": True,
+                "loaded": runtime._pipe is not None,
+                "model": runtime._model_id,
+                "jobs": len(self.state.jobs),
+                "queue_size": self.state.queue.qsize(),
+                "batch": self.state.batch_config(),
+            })
         if path == "/generate/params":
-            return self._json({"width": 1024, "height": 1024, "steps": 28, "guidance_scale": 5.0, "seed": 42, "model_id": DEFAULT_MODEL})
+            return self._json({"width": 1024, "height": 1024, "steps": 28, "guidance_scale": 5.0, "seed": 42, "model_id": DEFAULT_MODEL, **self.state.batch_config()})
+        if path in {"/batch/config", "/settings/batch"}:
+            return self._json(self.state.batch_config())
         if path in {"/models", "/settings/model"}:
             runtime = self.state.runtime
             return self._json({
@@ -558,6 +753,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"id": job.id, "status": job.status})
         if path == "/settings/model":
             return self._json({"default_model_id": DEFAULT_MODEL, "active_model_id": self.state.runtime._model_id, "loaded_model_id": self.state.runtime._model_id})
+        if path in {"/batch/config", "/settings/batch"}:
+            if not isinstance(payload, dict):
+                return self._json({"error": "payload must be an object"}, 400)
+            try:
+                return self._json(self.state.update_batch_config(payload))
+            except (TypeError, ValueError) as exc:
+                return self._json({"error": str(exc)}, 400)
         return self._json({"error": "not found"}, 404)
 
 
@@ -569,10 +771,16 @@ def main() -> int:
     parser.add_argument("--device", default=os.environ.get("AI_FLUX2_DEVICE", "cuda"))
     parser.add_argument("--dtype", default=os.environ.get("AI_FLUX2_DTYPE", "bfloat16"))
     parser.add_argument("--offload", default=os.environ.get("AI_FLUX2_OFFLOAD", "model"), choices=["none", "model", "sequential"])
+    parser.add_argument("--max-batch-size", type=int, default=int(os.environ.get("AI_FLUX2_MAX_BATCH_SIZE", str(DEFAULT_MAX_BATCH_SIZE))))
+    parser.add_argument("--batch-wait-ms", type=int, default=int(os.environ.get("AI_FLUX2_BATCH_WAIT_MS", str(DEFAULT_BATCH_WAIT_MS))))
     args = parser.parse_args()
 
     global STATE
-    STATE = AppState(FluxRuntime(output_dir=Path(args.output_dir), device=args.device, dtype=args.dtype, offload=args.offload))
+    STATE = AppState(
+        FluxRuntime(output_dir=Path(args.output_dir), device=args.device, dtype=args.dtype, offload=args.offload),
+        max_batch_size=args.max_batch_size,
+        batch_wait_ms=args.batch_wait_ms,
+    )
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"flux-vast-min-server listening on {args.host}:{args.port}", flush=True)
     server.serve_forever()
