@@ -26,7 +26,7 @@ The default model is `diffusers/FLUX.2-dev-bnb-4bit`, the supported public Diffu
 git clone https://github.com/tom-doerr/flux-vast-min-server.git /workspace/flux-vast-min-server
 cd /workspace/flux-vast-min-server
 python3 -m pip install --no-cache-dir -r requirements.txt
-nohup python3 flux_vast_min_server.py --host 0.0.0.0 --port 8910 --offload model --max-batch-size 2 --batch-wait-ms 1000 > /workspace/logs/flux.log 2>&1 &
+nohup python3 flux_vast_min_server.py --host 0.0.0.0 --port 8910 --offload none --preload-model flux2-dev-bnb-4bit --max-batch-size 2 --batch-wait-ms 1000 > /workspace/logs/flux.log 2>&1 &
 ```
 
 ## Test
@@ -39,6 +39,8 @@ curl -X POST http://HOST:8910/generate/enqueue \
 ```
 
 Then poll `/jobs/<id>` until `status` is `done` and download `/jobs/<id>/images/0`.
+
+For a dedicated GPU instance, use `--offload none --preload-model <model>` so the model is loaded before HTTP readiness and remains resident until the process exits or a different model is explicitly loaded. This server does not run an idle auto-unload timer.
 
 Dynamic batching is server-side. Clients can keep enqueuing one image per job; compatible queued jobs are coalesced up to `max_batch_size` within `batch_wait_ms`. The runtime settings can be changed without restart:
 

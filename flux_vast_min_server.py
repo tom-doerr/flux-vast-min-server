@@ -474,6 +474,10 @@ class FluxRuntime:
                 self._model_id = model_id
             return self._pipe
 
+    def preload(self, model_id: str | None = None) -> str:
+        self.pipe(normalize_model_id(model_id))
+        return self._model_id or normalize_model_id(model_id)
+
     def _write_job_images(self, job: Job, images: list[Image.Image]) -> None:
         if not images:
             raise RuntimeError("pipeline returned no images")
@@ -822,7 +826,14 @@ class Handler(BaseHTTPRequestHandler):
             job = self.state.enqueue(payload)
             return self._json({"id": job.id, "status": job.status})
         if path == "/settings/model":
-            return self._json({"default_model_id": DEFAULT_MODEL, "active_model_id": self.state.runtime._model_id, "loaded_model_id": self.state.runtime._model_id})
+            if not isinstance(payload, dict):
+                return self._json({"error": "payload must be an object"}, 400)
+            model_id = payload.get("model_id") or payload.get("active_model_id") or DEFAULT_MODEL
+            try:
+                loaded_model_id = self.state.runtime.preload(str(model_id))
+            except Exception as exc:
+                return self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+            return self._json({"default_model_id": DEFAULT_MODEL, "active_model_id": loaded_model_id, "loaded_model_id": loaded_model_id})
         if path in {"/batch/config", "/settings/batch"}:
             if not isinstance(payload, dict):
                 return self._json({"error": "payload must be an object"}, 400)
@@ -841,6 +852,7 @@ def main() -> int:
     parser.add_argument("--device", default=os.environ.get("AI_FLUX2_DEVICE", "cuda"))
     parser.add_argument("--dtype", default=os.environ.get("AI_FLUX2_DTYPE", "bfloat16"))
     parser.add_argument("--offload", default=os.environ.get("AI_FLUX2_OFFLOAD", "model"), choices=["none", "model", "sequential"])
+    parser.add_argument("--preload-model", default=os.environ.get("AI_FLUX2_PRELOAD_MODEL", ""), help="Load this model before accepting HTTP requests")
     parser.add_argument("--max-batch-size", type=int, default=int(os.environ.get("AI_FLUX2_MAX_BATCH_SIZE", str(DEFAULT_MAX_BATCH_SIZE))))
     parser.add_argument("--batch-wait-ms", type=int, default=int(os.environ.get("AI_FLUX2_BATCH_WAIT_MS", str(DEFAULT_BATCH_WAIT_MS))))
     args = parser.parse_args()
@@ -851,6 +863,9 @@ def main() -> int:
         max_batch_size=args.max_batch_size,
         batch_wait_ms=args.batch_wait_ms,
     )
+    if args.preload_model:
+        loaded_model_id = STATE.runtime.preload(args.preload_model)
+        print(f"preloaded Flux model {loaded_model_id}", flush=True)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"flux-vast-min-server listening on {args.host}:{args.port}", flush=True)
     server.serve_forever()
