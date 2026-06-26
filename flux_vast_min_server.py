@@ -244,6 +244,29 @@ class Job:
         }
 
 
+def rms(diff: np.ndarray) -> float:
+    """Root-mean-square over all elements of ``diff``."""
+    arr = np.asarray(diff, dtype=np.float64)
+    if arr.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(arr * arr)))
+
+
+def project_l2(x: np.ndarray, orig: np.ndarray, radius: float) -> np.ndarray:
+    """Project ``x`` so its RMS deviation from ``orig`` is at most ``radius``.
+
+    Adversarial-projection upscaler helper: scales ``x - orig`` down to RMS
+    ``radius`` (or leaves it if already inside the ball).
+    """
+    if radius <= 0.0:
+        return np.asarray(orig, dtype=np.float64).copy()
+    diff = np.asarray(x, dtype=np.float64) - np.asarray(orig, dtype=np.float64)
+    current = rms(diff)
+    if current <= radius or current == 0.0:
+        return np.asarray(orig, dtype=np.float64) + diff
+    return np.asarray(orig, dtype=np.float64) + diff * (radius / current)
+
+
 class FluxRuntime:
     def __init__(self, *, output_dir: Path, device: str, dtype: str, offload: str) -> None:
         self.output_dir = output_dir
@@ -477,6 +500,57 @@ class FluxRuntime:
     def preload(self, model_id: str | None = None) -> str:
         self.pipe(normalize_model_id(model_id))
         return self._model_id or normalize_model_id(model_id)
+
+    def upscale(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Adversarial-projection upscale reusing the loaded Flux2Pipeline."""
+        import base64
+        import io
+        import time as _time
+        from PIL import Image as _Image
+        image_b64 = str(payload.get("image_b64") or "")
+        if not image_b64:
+            raise RuntimeError("image_b64 is required")
+        prompt = str(payload.get("prompt") or "")
+        num_steps = max(1, int(payload.get("num_steps") or 8))
+        l2_radius = max(0.0, float(payload.get("l2_radius") or 0.05))
+        gain = max(0.0, float(payload.get("gain") or 2.0))
+        scale_factor = max(1, min(2, int(payload.get("scale_factor") or 2)))
+        small_n = max(2, int(payload.get("small_n") or 6))
+        model_id = normalize_model_id(payload.get("model_id"))
+        started = _time.perf_counter()
+        src = _Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
+        if scale_factor > 1:
+            src = src.resize((src.width * scale_factor, src.height * scale_factor), _Image.LANCZOS)
+        orig = np.asarray(src, dtype=np.float64) / 255.0
+        x = orig.copy()
+        final_l2 = 0.0
+        pipe = self.pipe(model_id)
+        for step in range(num_steps):
+            cur = _Image.fromarray(np.clip(x * 255.0, 0, 255).astype("uint8"), "RGB")
+            with self._generate_lock:
+                out = pipe(image=[cur], prompt=prompt or " ",
+                           num_inference_steps=small_n, guidance_scale=3.5,
+                           output_type="pil")
+            refined = out.images[0].convert("RGB")
+            if refined.size != cur.size:
+                refined = refined.resize(cur.size, _Image.LANCZOS)
+            refined_t = np.asarray(refined, dtype=np.float64) / 255.0
+            proposed = x + gain * (refined_t - x)
+            x = project_l2(proposed, orig, l2_radius)
+            final_l2 = rms(x - orig)
+            print(f"upscale step {step + 1}/{num_steps} l2={final_l2:.4f}", flush=True)
+        out_img = _Image.fromarray(np.clip(x * 255.0, 0, 255).astype("uint8"), "RGB")
+        buf = io.BytesIO()
+        out_img.save(buf, format="PNG")
+        return {
+            "image_b64": base64.b64encode(buf.getvalue()).decode("ascii"),
+            "width": out_img.width,
+            "height": out_img.height,
+            "took_ms": int((_time.perf_counter() - started) * 1000.0),
+            "final_l2": float(final_l2),
+            "num_steps": num_steps,
+            "l2_radius": l2_radius,
+        }
 
     def _write_job_images(self, job: Job, images: list[Image.Image]) -> None:
         if not images:
@@ -841,6 +915,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(self.state.update_batch_config(payload))
             except (TypeError, ValueError) as exc:
                 return self._json({"error": str(exc)}, 400)
+        if path == "/upscale":
+            if not isinstance(payload, dict):
+                return self._json({"error": "payload must be an object"}, 400)
+            try:
+                return self._json(self.state.runtime.upscale(payload))
+            except Exception as exc:  # noqa: BLE001
+                return self._json({"error": str(exc)}, 500)
         return self._json({"error": "not found"}, 404)
 
 
