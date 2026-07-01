@@ -51,6 +51,20 @@ def gpu_status() -> dict[str, Any]:
         return {"cuda": False, "error": str(exc)}
 
 
+def _frame_to_pil(frame: Any):
+    """WanPipeline returns frames as numpy arrays; convert one to a PIL image
+    for the keyframe png. Handles uint8 and float[0,1]/float[0,255]."""
+    from PIL import Image
+    import numpy as np
+    if hasattr(frame, "save"):
+        return frame
+    arr = np.asarray(frame)
+    if arr.dtype != np.uint8:
+        scaled = arr * 255.0 if float(np.nanmax(arr) if arr.size else 0.0) <= 1.0 else arr
+        arr = np.clip(scaled, 0, 255).astype("uint8")
+    return Image.fromarray(arr)
+
+
 @dataclass
 class VideoRecord:
     path: Path            # mp4
@@ -173,7 +187,7 @@ class WanRuntime:
         mp4_path = base.with_suffix(".mp4")
         export_to_video(frames, str(mp4_path), fps=fps)
         keyframe_path = base.with_suffix(".png")
-        frames[len(frames) // 2].save(keyframe_path)
+        _frame_to_pil(frames[len(frames) // 2]).save(keyframe_path)
         job.videos = [VideoRecord(mp4_path, keyframe_path, width, height, num_frames, fps)]
 
     def _load_embedder(self):
