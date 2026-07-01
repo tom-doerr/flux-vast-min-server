@@ -1,0 +1,7 @@
+# Extra deps for wan_vast_min_server.py (video gen + on-box video embedding).
+# The base requirements.txt already brings diffusers (git), transformers,
+# accelerate, safetensors, huggingface_hub, numpy, pillow, sentencepiece.
+imageio>=2.34.0
+imageio-ffmpeg>=0.4.9
+av>=12.0.0
+ftfy>=6.1.0
