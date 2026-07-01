@@ -257,6 +257,26 @@ class AppState:
         self._queue: "queue.Queue[int]" = queue.Queue()
         self._worker = threading.Thread(target=self._loop, name="wan-worker", daemon=True)
         self._worker.start()
+        self.preloading = False
+        self.preload_error = ""
+
+    def start_preload(self, model_id: str) -> None:
+        """Load the generation model in a background thread so the HTTP server
+        + the small independent embedder come up immediately."""
+        self.preloading = True
+        self.preload_error = ""
+        threading.Thread(target=self._preload_run, args=(model_id,),
+                         name="wan-preload", daemon=True).start()
+
+    def _preload_run(self, model_id: str) -> None:
+        try:
+            self.runtime.preload(model_id)
+            print(f"preloaded {model_id}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            self.preload_error = f"{type(exc).__name__}: {exc}"
+            print(f"preload failed: {exc}", flush=True)
+        finally:
+            self.preloading = False
 
     def enqueue(self, payload: dict[str, Any]) -> Job:
         with self._lock:
@@ -333,6 +353,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             rt = self.state.runtime
             return self._json({"ok": True, "loaded": rt._pipe is not None,
+                               "preloading": self.state.preloading,
+                               "preload_error": self.state.preload_error,
                                "model": rt._model_id, "embed_model": rt._embed_model_id,
                                **self.state.status(), "gpu": gpu_status()})
         if path == "/jobs":
@@ -418,11 +440,7 @@ def main() -> int:
                          embed_model=args.embed_model, offload=args.offload)
     STATE = AppState(runtime)
     if args.preload_model:
-        try:
-            runtime.preload(args.preload_model)
-            print(f"preloaded {args.preload_model}", flush=True)
-        except Exception as exc:  # noqa: BLE001
-            print(f"preload failed: {exc}", flush=True)
+        STATE.start_preload(args.preload_model)  # background: HTTP + embedder ready now
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"wan video server listening on {args.host}:{args.port}", flush=True)
     try:
