@@ -99,11 +99,12 @@ class Job:
 
 class WanRuntime:
     def __init__(self, *, output_dir: Path, device: str, dtype: str,
-                 model_id: str, embed_model: str) -> None:
+                 model_id: str, embed_model: str, offload: str = "model") -> None:
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.device = device
         self.dtype = dtype
+        self.offload = offload
         self._model_id = model_id
         self._embed_model_id = embed_model
         self._pipe = None
@@ -121,10 +122,17 @@ class WanRuntime:
         import torch
         from diffusers import WanPipeline
         pipe = WanPipeline.from_pretrained(model_id, torch_dtype=self._dtype_obj())
-        if self.device.startswith("cuda") and torch.cuda.is_available():
-            pipe = pipe.to(self.device)
-        else:
+        cuda = self.device.startswith("cuda") and torch.cuda.is_available()
+        if not cuda:
             pipe.enable_model_cpu_offload()
+        elif self.offload == "sequential":
+            pipe.enable_sequential_cpu_offload()
+        elif self.offload == "model":
+            # Keep only the active expert resident (Wan2.2-A14B is ~56GB in bf16);
+            # model offload fits it on an 80GB card alongside 720p activations.
+            pipe.enable_model_cpu_offload()
+        else:
+            pipe = pipe.to(self.device)
         return pipe
 
     def pipe(self, model_id: str | None = None):
@@ -376,6 +384,8 @@ def main() -> int:
     parser.add_argument("--output-dir", default=os.environ.get("WAN_OUTPUT_DIR", "/data/out_videos/wan-vast-min"))
     parser.add_argument("--device", default=os.environ.get("WAN_DEVICE", "cuda"))
     parser.add_argument("--dtype", default=os.environ.get("WAN_DTYPE", "bfloat16"))
+    parser.add_argument("--offload", default=os.environ.get("WAN_OFFLOAD", "model"),
+                        choices=["none", "model", "sequential"])
     parser.add_argument("--preload-model", default=os.environ.get("WAN_PRELOAD_MODEL", DEFAULT_MODEL))
     parser.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL)
     parser.add_argument("--width", type=int, default=DEFAULT_WIDTH)
@@ -387,7 +397,7 @@ def main() -> int:
     DEFAULT_NUM_FRAMES, DEFAULT_FPS = args.num_frames, args.fps
     runtime = WanRuntime(output_dir=Path(args.output_dir), device=args.device,
                          dtype=args.dtype, model_id=args.preload_model or DEFAULT_MODEL,
-                         embed_model=args.embed_model)
+                         embed_model=args.embed_model, offload=args.offload)
     STATE = AppState(runtime)
     if args.preload_model:
         try:
