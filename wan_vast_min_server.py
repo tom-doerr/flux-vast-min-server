@@ -195,7 +195,9 @@ class WanRuntime:
         from transformers import AutoImageProcessor, AutoModel
         if self._embedder is None:
             self._embed_processor = AutoImageProcessor.from_pretrained(self._embed_model_id)
-            model = AutoModel.from_pretrained(self._embed_model_id, torch_dtype=self._dtype_obj())
+            # float32 for the small embedder: HF image processors emit float32
+            # pixel_values, so a bf16 model trips a dtype mismatch.
+            model = AutoModel.from_pretrained(self._embed_model_id)
             if self.device.startswith("cuda") and torch.cuda.is_available():
                 model = model.to(self.device)
             self._embedder = model.eval()
@@ -236,7 +238,9 @@ class WanRuntime:
         with self._embed_lock:
             model, proc = self._load_embedder()
             inputs = proc(frames, return_tensors="pt")
-            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+            mdtype = next(model.parameters()).dtype
+            inputs = {k: (v.to(model.device, mdtype) if torch.is_floating_point(v) else v.to(model.device))
+                      for k, v in inputs.items()}
             with torch.no_grad():
                 out = model(**inputs)
             hidden = out.last_hidden_state  # (1, seq, dim)
