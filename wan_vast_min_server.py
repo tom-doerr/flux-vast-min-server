@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""Minimal Wan 2.2 text-to-video server for Idea Rank.
+
+Sibling of flux_vast_min_server.py. Runs on the rented Vast.ai box alongside
+vLLM. Mirrors the FLUX enqueue/poll/download job contract but for VIDEO, and
+adds an on-box /embed endpoint so generated clips are embedded where the bytes
+already are (videos are too large to ship back to spark-2).
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import queue
+import threading
+import time
+import traceback
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+DEFAULT_MODEL = os.environ.get("WAN_MODEL", "Wan-AI/Wan2.2-T2V-A14B-Diffusers")
+DEFAULT_EMBED_MODEL = os.environ.get("WAN_EMBED_MODEL", "MCG-NJU/videomae-base")
+DEFAULT_WIDTH = int(os.environ.get("WAN_WIDTH", "1280"))
+DEFAULT_HEIGHT = int(os.environ.get("WAN_HEIGHT", "720"))
+DEFAULT_NUM_FRAMES = int(os.environ.get("WAN_NUM_FRAMES", "81"))  # ~5s @16fps
+DEFAULT_FPS = int(os.environ.get("WAN_FPS", "16"))
+DEFAULT_STEPS = int(os.environ.get("WAN_STEPS", "40"))
+DEFAULT_GUIDANCE = float(os.environ.get("WAN_GUIDANCE", "5.0"))
+EMBED_FRAMES = int(os.environ.get("WAN_EMBED_FRAMES", "16"))  # VideoMAE clip length
+
+STATE: "AppState | None" = None
+
+
+def gpu_status() -> dict[str, Any]:
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return {"cuda": False}
+        free, total = torch.cuda.mem_get_info()
+        return {
+            "cuda": True,
+            "device": torch.cuda.get_device_name(0),
+            "free_gb": round(free / 1e9, 2),
+            "total_gb": round(total / 1e9, 2),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"cuda": False, "error": str(exc)}
+
+
+@dataclass
+class VideoRecord:
+    path: Path            # mp4
+    keyframe_path: Path   # png
+    width: int
+    height: int
+    num_frames: int
+    fps: int
+
+    def payload(self, job_id: int, index: int = 0) -> dict[str, Any]:
+        return {
+            "index": index,
+            "video_url": f"/jobs/{job_id}/videos/{index}",
+            "keyframe_url": f"/jobs/{job_id}/videos/{index}/keyframe",
+            "width": self.width,
+            "height": self.height,
+            "num_frames": self.num_frames,
+            "fps": self.fps,
+        }
+
+
+@dataclass
+class Job:
+    id: int
+    payload: dict[str, Any]
+    status: str = "queued"
+    created_at: float = field(default_factory=time.time)
+    started_at: float | None = None
+    finished_at: float | None = None
+    error: str | None = None
+    traceback: str | None = None
+    videos: list[VideoRecord] = field(default_factory=list)
+
+    def payload_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "status": self.status,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "error": self.error,
+            "videos": [v.payload(self.id, i) for i, v in enumerate(self.videos)],
+            "payload": self.payload,
+        }
+
+
+class WanRuntime:
+    def __init__(self, *, output_dir: Path, device: str, dtype: str,
+                 model_id: str, embed_model: str) -> None:
+        self.output_dir = output_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.device = device
+        self.dtype = dtype
+        self._model_id = model_id
+        self._embed_model_id = embed_model
+        self._pipe = None
+        self._embedder = None
+        self._embed_processor = None
+        self._lock = threading.Lock()
+        self._embed_lock = threading.Lock()
+
+    def _dtype_obj(self):
+        import torch
+        return {"bfloat16": torch.bfloat16, "float16": torch.float16,
+                "float32": torch.float32}.get(self.dtype, torch.bfloat16)
+
+    def _load_pipe(self, model_id: str):
+        import torch
+        from diffusers import WanPipeline
+        pipe = WanPipeline.from_pretrained(model_id, torch_dtype=self._dtype_obj())
+        if self.device.startswith("cuda") and torch.cuda.is_available():
+            pipe = pipe.to(self.device)
+        else:
+            pipe.enable_model_cpu_offload()
+        return pipe
+
+    def pipe(self, model_id: str | None = None):
+        target = model_id or self._model_id
+        with self._lock:
+            if self._pipe is None or target != self._model_id:
+                self._pipe = self._load_pipe(target)
+                self._model_id = target
+            return self._pipe
+
+    def preload(self, model_id: str | None = None) -> str:
+        self.pipe(model_id)
+        return self._model_id
+
+    def generate(self, job: Job) -> None:
+        import torch
+        from diffusers.utils import export_to_video
+        p = job.payload
+        width = int(p.get("width") or DEFAULT_WIDTH)
+        height = int(p.get("height") or DEFAULT_HEIGHT)
+        num_frames = int(p.get("num_frames") or DEFAULT_NUM_FRAMES)
+        fps = int(p.get("fps") or DEFAULT_FPS)
+        steps = int(p.get("steps") or DEFAULT_STEPS)
+        guidance = float(p.get("guidance") if p.get("guidance") is not None else DEFAULT_GUIDANCE)
+        seed = int(p.get("seed") or 42)
+        prompt = str(p.get("prompt") or "")
+        pipe = self.pipe(str(p.get("model_id") or self._model_id))
+        gen_device = "cuda" if torch.cuda.is_available() and self.device.startswith("cuda") else "cpu"
+        generator = torch.Generator(device=gen_device).manual_seed(seed)
+        result = pipe(
+            prompt=prompt,
+            negative_prompt=str(p.get("negative_prompt") or ""),
+            height=height, width=width, num_frames=num_frames,
+            num_inference_steps=steps, guidance_scale=guidance, generator=generator,
+        )
+        frames = result.frames[0]  # list[PIL.Image]
+        base = self.output_dir / f"job_{job.id:06d}"
+        mp4_path = base.with_suffix(".mp4")
+        export_to_video(frames, str(mp4_path), fps=fps)
+        keyframe_path = base.with_suffix(".png")
+        frames[len(frames) // 2].save(keyframe_path)
+        job.videos = [VideoRecord(mp4_path, keyframe_path, width, height, num_frames, fps)]
+
+    def _load_embedder(self):
+        import torch
+        from transformers import AutoImageProcessor, AutoModel
+        if self._embedder is None:
+            self._embed_processor = AutoImageProcessor.from_pretrained(self._embed_model_id)
+            model = AutoModel.from_pretrained(self._embed_model_id, torch_dtype=self._dtype_obj())
+            if self.device.startswith("cuda") and torch.cuda.is_available():
+                model = model.to(self.device)
+            self._embedder = model.eval()
+        return self._embedder, self._embed_processor
+
+    def _sample_frames(self, mp4_path: Path, count: int):
+        import imageio.v3 as iio
+        import numpy as np
+        frames = list(iio.imiter(str(mp4_path), plugin="pyav"))
+        if not frames:
+            return []
+        if len(frames) <= count:
+            idx = list(range(len(frames)))
+        else:
+            idx = [int(round(i * (len(frames) - 1) / (count - 1))) for i in range(count)]
+        return [np.asarray(frames[i]) for i in idx]
+
+    def _resolve_video_path(self, payload: dict[str, Any]) -> Path:
+        job_id = payload.get("job_id")
+        if job_id is not None and STATE is not None:
+            job = STATE.get(int(job_id))
+            if job is not None and job.videos:
+                return job.videos[0].path
+        b64 = payload.get("video_b64")
+        if b64:
+            data = base64.b64decode(b64)
+            tmp = self.output_dir / f"embed_{int(time.time()*1000)}.mp4"
+            tmp.write_bytes(data)
+            return tmp
+        raise ValueError("embed requires job_id (with a ready video) or video_b64")
+
+    def embed(self, payload: dict[str, Any]) -> dict[str, Any]:
+        import torch
+        mp4_path = self._resolve_video_path(payload)
+        frames = self._sample_frames(mp4_path, EMBED_FRAMES)
+        if not frames:
+            raise ValueError("no frames to embed")
+        with self._embed_lock:
+            model, proc = self._load_embedder()
+            inputs = proc(frames, return_tensors="pt")
+            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+            with torch.no_grad():
+                out = model(**inputs)
+            hidden = out.last_hidden_state  # (1, seq, dim)
+            vec = hidden.float().mean(dim=1).squeeze(0).cpu().tolist()
+        return {"embedding": vec, "dims": len(vec), "model": self._embed_model_id}
+
+
+class AppState:
+    def __init__(self, runtime: WanRuntime) -> None:
+        self.runtime = runtime
+        self._jobs: dict[int, Job] = {}
+        self._counter = 0
+        self._lock = threading.Lock()
+        self._queue: "queue.Queue[int]" = queue.Queue()
+        self._worker = threading.Thread(target=self._loop, name="wan-worker", daemon=True)
+        self._worker.start()
+
+    def enqueue(self, payload: dict[str, Any]) -> Job:
+        with self._lock:
+            self._counter += 1
+            job = Job(id=self._counter, payload=payload)
+            self._jobs[job.id] = job
+        self._queue.put(job.id)
+        return job
+
+    def get(self, job_id: int) -> Job | None:
+        with self._lock:
+            return self._jobs.get(int(job_id))
+
+    def list_jobs(self, *, limit: int) -> list[Job]:
+        with self._lock:
+            jobs = sorted(self._jobs.values(), key=lambda j: j.id, reverse=True)
+        return jobs[:limit]
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            counts: dict[str, int] = {}
+            for j in self._jobs.values():
+                counts[j.status] = counts.get(j.status, 0) + 1
+            total = len(self._jobs)
+        return {"jobs_total": total, "status_counts": counts, "model": self.runtime._model_id}
+
+    def _loop(self) -> None:
+        while True:
+            job_id = self._queue.get()
+            job = self.get(job_id)
+            if job is None:
+                continue
+            job.status = "running"
+            job.started_at = time.time()
+            try:
+                self.runtime.generate(job)
+                job.status = "done"
+            except Exception as exc:  # noqa: BLE001
+                job.status = "error"
+                job.error = f"{type(exc).__name__}: {exc}"
+                job.traceback = traceback.format_exc()
+            finally:
+                job.finished_at = time.time()
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt: str, *args: Any) -> None:
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {self.client_address[0]} {fmt % args}", flush=True)
+
+    @property
+    def state(self) -> AppState:
+        if STATE is None:
+            raise RuntimeError("server state not initialized")
+        return STATE
+
+    def _json(self, payload: dict[str, Any], status: int = 200) -> None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _bytes(self, data: bytes, content_type: str, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        if path == "/health":
+            rt = self.state.runtime
+            return self._json({"ok": True, "loaded": rt._pipe is not None,
+                               "model": rt._model_id, "embed_model": rt._embed_model_id,
+                               **self.state.status(), "gpu": gpu_status()})
+        if path == "/jobs":
+            query = parse_qs(parsed.query)
+            limit = max(1, int((query.get("limit") or ["25"])[0]))
+            return self._json({"jobs": [j.payload_dict() for j in self.state.list_jobs(limit=limit)]})
+        return self._get_job(path)
+
+    def _get_job(self, path: str) -> None:
+        parts = path.strip("/").split("/")
+        if len(parts) < 2 or parts[0] != "jobs":
+            return self._json({"error": "not found"}, 404)
+        try:
+            job_id = int(parts[1])
+        except ValueError:
+            return self._json({"error": "bad job id"}, 400)
+        job = self.state.get(job_id)
+        if job is None:
+            return self._json({"error": "not found"}, 404)
+        if len(parts) == 2:
+            return self._json(job.payload_dict())
+        if len(parts) >= 4 and parts[2] == "videos":
+            try:
+                idx = int(parts[3])
+            except ValueError:
+                return self._json({"error": "bad video index"}, 400)
+            if idx < 0 or idx >= len(job.videos):
+                return self._json({"error": "video not ready"}, 404)
+            rec = job.videos[idx]
+            if len(parts) >= 5 and parts[4] == "keyframe":
+                return self._bytes(rec.keyframe_path.read_bytes(), "image/png")
+            return self._bytes(rec.path.read_bytes(), "video/mp4")
+        return self._json({"error": "not found"}, 404)
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            return self._json({"error": "invalid json"}, 400)
+        if not isinstance(payload, dict):
+            return self._json({"error": "payload must be an object"}, 400)
+        if path == "/generate/enqueue":
+            job = self.state.enqueue(payload)
+            return self._json({"id": job.id, "status": job.status})
+        if path == "/embed":
+            try:
+                return self._json(self.state.runtime.embed(payload))
+            except Exception as exc:  # noqa: BLE001
+                return self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+        if path == "/settings/model":
+            try:
+                loaded = self.state.runtime.preload(str(payload.get("model_id") or DEFAULT_MODEL))
+            except Exception as exc:  # noqa: BLE001
+                return self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+            return self._json({"loaded_model_id": loaded})
+        return self._json({"error": "not found"}, 404)
+
+
+def main() -> int:
+    global STATE, DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_NUM_FRAMES, DEFAULT_FPS
+    parser = argparse.ArgumentParser(description="Wan 2.2 text-to-video server")
+    parser.add_argument("--host", default=os.environ.get("WAN_HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("WAN_PORT", "8910")))
+    parser.add_argument("--output-dir", default=os.environ.get("WAN_OUTPUT_DIR", "/data/out_videos/wan-vast-min"))
+    parser.add_argument("--device", default=os.environ.get("WAN_DEVICE", "cuda"))
+    parser.add_argument("--dtype", default=os.environ.get("WAN_DTYPE", "bfloat16"))
+    parser.add_argument("--preload-model", default=os.environ.get("WAN_PRELOAD_MODEL", DEFAULT_MODEL))
+    parser.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL)
+    parser.add_argument("--width", type=int, default=DEFAULT_WIDTH)
+    parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
+    parser.add_argument("--num-frames", type=int, default=DEFAULT_NUM_FRAMES)
+    parser.add_argument("--fps", type=int, default=DEFAULT_FPS)
+    args = parser.parse_args()
+    DEFAULT_WIDTH, DEFAULT_HEIGHT = args.width, args.height
+    DEFAULT_NUM_FRAMES, DEFAULT_FPS = args.num_frames, args.fps
+    runtime = WanRuntime(output_dir=Path(args.output_dir), device=args.device,
+                         dtype=args.dtype, model_id=args.preload_model or DEFAULT_MODEL,
+                         embed_model=args.embed_model)
+    STATE = AppState(runtime)
+    if args.preload_model:
+        try:
+            runtime.preload(args.preload_model)
+            print(f"preloaded {args.preload_model}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"preload failed: {exc}", flush=True)
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f"wan video server listening on {args.host}:{args.port}", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
