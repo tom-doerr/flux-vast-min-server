@@ -506,9 +506,12 @@ def main() -> int:
     parser.add_argument("--dtype", default=os.environ.get("WAN_DTYPE", "bfloat16"))
     parser.add_argument("--offload", default=os.environ.get("WAN_OFFLOAD", "model"),
                         choices=["none", "model", "sequential"])
-    parser.add_argument("--runtime", default=os.environ.get("WAN_RUNTIME", "diffusers"),
+    parser.add_argument("--runtime", default=os.environ.get("WAN_RUNTIME", "lightx2v"),
                         choices=["diffusers", "lightx2v"],
-                        help="lightx2v proxies generation to a LightX2V server (NVFP4 distill)")
+                        help="DEFAULT lightx2v: proxy to a LightX2V server (4-step distill, "
+                             "~6x faster). Fails LOUDLY if that server is down -- no silent "
+                             "fallback to the slow in-process diffusers runtime; pass "
+                             "--runtime diffusers explicitly for the legacy path.")
     parser.add_argument("--lightx2v-url", default=os.environ.get("WAN_LIGHTX2V_URL", "http://127.0.0.1:8912"))
     parser.add_argument("--preload-model", default=os.environ.get("WAN_PRELOAD_MODEL", DEFAULT_MODEL))
     parser.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL)
