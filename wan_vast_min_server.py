@@ -113,12 +113,15 @@ class Job:
 
 class WanRuntime:
     def __init__(self, *, output_dir: Path, device: str, dtype: str,
-                 model_id: str, embed_model: str, offload: str = "model") -> None:
+                 model_id: str, embed_model: str, offload: str = "model",
+                 runtime: str = "diffusers", lightx2v_url: str = "http://127.0.0.1:8912") -> None:
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.device = device
         self.dtype = dtype
         self.offload = offload
+        self.runtime = runtime  # 'diffusers' (in-process) | 'lightx2v' (proxy)
+        self.lightx2v_url = lightx2v_url.rstrip("/")
         self._model_id = model_id
         self._embed_model_id = embed_model
         self._pipe = None
@@ -161,7 +164,70 @@ class WanRuntime:
         self.pipe(model_id)
         return self._model_id
 
+    def _generate_lightx2v(self, job: Job) -> None:
+        """Proxy generation to a LightX2V server (NVFP4 step-distilled Wan2.2).
+        steps/guidance from the payload are IGNORED: the distilled model has a
+        fixed 4-step expert schedule and cfg disabled -- overriding them would
+        break quality. width/height/frames/fps/seed pass through."""
+        p = job.payload
+        width = int(p.get("width") or DEFAULT_WIDTH)
+        height = int(p.get("height") or DEFAULT_HEIGHT)
+        num_frames = int(p.get("num_frames") or DEFAULT_NUM_FRAMES)
+        fps = int(p.get("fps") or DEFAULT_FPS)
+        seed = int(p.get("seed") or 42)
+        name = f"job_{job.id:06d}.mp4"
+        resp = self._lx2v("POST", "/v1/tasks/video/", {
+            "prompt": str(p.get("prompt") or ""),
+            "negative_prompt": str(p.get("negative_prompt") or ""),
+            "seed": seed,
+            "target_shape": [height, width],
+            "target_video_length": num_frames,
+            "target_fps": fps,
+            "save_result_path": name,
+        }, timeout=60)
+        task_id = resp.get("task_id") or ""
+        if not task_id:
+            raise RuntimeError(f"lightx2v enqueue failed: {resp}")
+        result_name = resp.get("save_result_path") or name
+        deadline = time.time() + 1800
+        status = ""
+        while time.time() < deadline:
+            st = self._lx2v("GET", f"/v1/tasks/{task_id}/status", timeout=30)
+            status = ""
+            if isinstance(st, dict):
+                status = str(st.get("task_status") or st.get("status") or "").lower()
+            if status in {"completed", "success", "succeed", "finished"}:
+                break
+            if status in {"failed", "error", "cancelled"}:
+                raise RuntimeError(f"lightx2v task {task_id} failed: {st}")
+            time.sleep(2)
+        else:
+            raise TimeoutError(f"lightx2v task {task_id} not done (last status {status!r})")
+        mp4_bytes = self._lx2v("GET", f"/v1/files/download/{result_name}", timeout=180)
+        if not isinstance(mp4_bytes, (bytes, bytearray)) or len(mp4_bytes) < 1000:
+            raise RuntimeError(f"lightx2v result download too small: {len(mp4_bytes) if isinstance(mp4_bytes,(bytes,bytearray)) else type(mp4_bytes)}")
+        base = self.output_dir / f"job_{job.id:06d}"
+        mp4_path = base.with_suffix(".mp4")
+        mp4_path.write_bytes(bytes(mp4_bytes))
+        keyframe_path = base.with_suffix(".png")
+        frames = self._sample_frames(mp4_path, count=3)
+        if not frames:
+            raise RuntimeError("lightx2v result has no decodable frames")
+        _frame_to_pil(frames[len(frames) // 2]).save(keyframe_path)
+        job.videos = [VideoRecord(mp4_path, keyframe_path, width, height, num_frames, fps)]
+
+    def _lx2v(self, method: str, path: str, payload: dict | None = None, timeout: float = 60):
+        import urllib.request
+        data = json.dumps(payload).encode() if payload is not None else None
+        req = urllib.request.Request(self.lightx2v_url + path, data=data, method=method,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read()
+        return json.loads(body) if body[:1] in (b"{", b"[") else body
+
     def generate(self, job: Job) -> None:
+        if self.runtime == "lightx2v":
+            return self._generate_lightx2v(job)
         import torch
         from diffusers.utils import export_to_video
         p = job.payload
@@ -347,11 +413,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _lightx2v_health(self, rt) -> dict[str, Any]:
+        try:
+            q = rt._lx2v("GET", "/v1/tasks/queue/status", timeout=5)
+            lx_ok = isinstance(q, dict)
+        except Exception:
+            lx_ok, q = False, {}
+        return {"ok": True, "loaded": lx_ok, "preloading": False,
+                "preload_error": "" if lx_ok else "lightx2v unreachable",
+                "runtime": "lightx2v", "lightx2v": q if isinstance(q, dict) else {},
+                "model": rt._model_id, "embed_model": rt._embed_model_id,
+                **self.state.status(), "gpu": gpu_status()}
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         if path == "/health":
             rt = self.state.runtime
+            if rt.runtime == "lightx2v":
+                return self._json(self._lightx2v_health(rt))
             return self._json({"ok": True, "loaded": rt._pipe is not None,
                                "preloading": self.state.preloading,
                                "preload_error": self.state.preload_error,
@@ -426,6 +506,10 @@ def main() -> int:
     parser.add_argument("--dtype", default=os.environ.get("WAN_DTYPE", "bfloat16"))
     parser.add_argument("--offload", default=os.environ.get("WAN_OFFLOAD", "model"),
                         choices=["none", "model", "sequential"])
+    parser.add_argument("--runtime", default=os.environ.get("WAN_RUNTIME", "diffusers"),
+                        choices=["diffusers", "lightx2v"],
+                        help="lightx2v proxies generation to a LightX2V server (NVFP4 distill)")
+    parser.add_argument("--lightx2v-url", default=os.environ.get("WAN_LIGHTX2V_URL", "http://127.0.0.1:8912"))
     parser.add_argument("--preload-model", default=os.environ.get("WAN_PRELOAD_MODEL", DEFAULT_MODEL))
     parser.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL)
     parser.add_argument("--width", type=int, default=DEFAULT_WIDTH)
@@ -437,9 +521,10 @@ def main() -> int:
     DEFAULT_NUM_FRAMES, DEFAULT_FPS = args.num_frames, args.fps
     runtime = WanRuntime(output_dir=Path(args.output_dir), device=args.device,
                          dtype=args.dtype, model_id=args.preload_model or DEFAULT_MODEL,
-                         embed_model=args.embed_model, offload=args.offload)
+                         embed_model=args.embed_model, offload=args.offload,
+                         runtime=args.runtime, lightx2v_url=args.lightx2v_url)
     STATE = AppState(runtime)
-    if args.preload_model:
+    if args.preload_model and args.runtime == "diffusers":
         STATE.start_preload(args.preload_model)  # background: HTTP + embedder ready now
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"wan video server listening on {args.host}:{args.port}", flush=True)
