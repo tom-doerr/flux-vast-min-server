@@ -4,8 +4,8 @@
 # resident + VideoMAE co-loaded) -> prints RESULTS -> stops the container.
 # All output to stdout so `vastai logs` shows everything without ssh.
 set -x
-PY=/app/miniconda/bin/python
-PIP=/app/miniconda/bin/pip
+PY="${BENCH_PY:-/app/miniconda/bin/python}"
+PIP="${BENCH_PIP:-/app/miniconda/bin/pip}"
 M=/workspace/models
 
 cd /workspace
