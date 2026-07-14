@@ -23,7 +23,14 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 DEFAULT_MODEL = os.environ.get("WAN_MODEL", "Wan-AI/Wan2.2-T2V-A14B-Diffusers")
-DEFAULT_EMBED_MODEL = os.environ.get("WAN_EMBED_MODEL", "MCG-NJU/videomae-base")
+# The FINE-TUNED checkpoint, not the raw MAE one. `videomae-base` is the masked
+# autoencoder PRETRAINING checkpoint: its features reconstruct pixels and are
+# not semantically separable -- measured on 250 rated clips they collapse to an
+# effective rank of 8.8 of 768 dims (mean pairwise cosine 0.968) and predict
+# ratings with spearman +0.000, i.e. no better than guessing the mean. The
+# Kinetics-finetuned checkpoint of the SAME architecture: rank 86.1, +0.193.
+DEFAULT_EMBED_MODEL = os.environ.get(
+    "WAN_EMBED_MODEL", "MCG-NJU/videomae-base-finetuned-kinetics")
 DEFAULT_WIDTH = int(os.environ.get("WAN_WIDTH", "1280"))
 DEFAULT_HEIGHT = int(os.environ.get("WAN_HEIGHT", "720"))
 DEFAULT_NUM_FRAMES = int(os.environ.get("WAN_NUM_FRAMES", "81"))  # ~5s @16fps
