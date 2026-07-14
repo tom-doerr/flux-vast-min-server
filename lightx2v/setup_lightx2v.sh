@@ -38,4 +38,20 @@ snapshot_download("lightx2v/Wan2.2-Distill-Loras", allow_patterns=["*t2v*"],
 PYEOF
 
 sed "s|/workspace/models|$MODELS|g" "$HERE/wan22_t2v_4step_720p.json" > "$BASE_DIR/lx2v_t2v.json"
+
+# <60GB VRAM (e.g. RTX 5090 32GB) cannot hold both bf16 experts resident:
+# enable block offload (weights live in host RAM, blocks swap per step).
+# lazy_load is NOT used — it requires lora_dynamic_apply in this build.
+VRAM_MIB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1 || echo 0)"
+if [ "${VRAM_MIB:-0}" -lt 60000 ]; then
+  python3 - <<PYEOF
+import json
+p = "$BASE_DIR/lx2v_t2v.json"
+c = json.load(open(p))
+c.update(cpu_offload=True, t5_cpu_offload=True, vae_cpu_offload=True,
+         offload_granularity="block")
+json.dump(c, open(p, "w"), indent=1)
+print("low-VRAM offload config applied", c["cpu_offload"])
+PYEOF
+fi
 echo "LIGHTX2V_SETUP_DONE"
