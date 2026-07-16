@@ -48,12 +48,19 @@ def gpu_status() -> dict[str, Any]:
         if not torch.cuda.is_available():
             return {"cuda": False}
         free, total = torch.cuda.mem_get_info()
-        return {
+        out = {
             "cuda": True,
             "device": torch.cuda.get_device_name(0),
             "free_gb": round(free / 1e9, 2),
             "total_gb": round(total / 1e9, 2),
         }
+        # Real utilization when NVML is available. Omitted (not 0) when it
+        # isn't -- the panel must render "-" for a value nobody measured.
+        try:
+            out["utilization_gpu_pct"] = float(torch.cuda.utilization(0))
+        except Exception:  # noqa: BLE001
+            pass
+        return out
     except Exception as exc:  # noqa: BLE001
         return {"cuda": False, "error": str(exc)}
 
