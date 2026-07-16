@@ -39,8 +39,17 @@ c = json.load(open(src))
 c.update(
     target_height=720, target_width=1280,
     high_noise_quantized_ckpt=q % "high", low_noise_quantized_ckpt=q % "low",
+    # Wan2.2 MoE high/low-noise expert switch. The NVFP4-Sparse template omits
+    # it -> the Wan22MoeRunner dies with KeyError: 'boundary'. Match the bf16 cfg.
+    boundary=0.875,
     # quantized experts fit resident in ~18GB -> no block offload needed
     cpu_offload=False, t5_cpu_offload=True, vae_cpu_offload=True,
+    # sla_attn (the template's self-attn) needs spas_sage_attn, which this build
+    # does not install -> "spas_sage_attn is not installed" + worker init fails.
+    # torch_sdpa is the proven fallback (same as the bf16 config); NVFP4
+    # quantisation is still the speedup. (Install spas_sage_attn for the extra
+    # sparse-attention gain later.)
+    self_attn_1_type="torch_sdpa",
     # cross-attn would fall back to sage_attn2, which has no sm_120 kernel
     cross_attn_1_type="torch_sdpa", cross_attn_2_type="torch_sdpa",
 )
