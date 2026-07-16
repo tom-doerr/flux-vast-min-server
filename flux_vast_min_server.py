@@ -137,7 +137,7 @@ def gpu_status() -> dict[str, Any]:
         proc = subprocess.run(
             [
                 "nvidia-smi",
-                "--query-gpu=name,memory.used,memory.total,utilization.gpu",
+                "--query-gpu=name,memory.used,memory.total,utilization.gpu,power.draw,power.limit",
                 "--format=csv,noheader,nounits",
             ],
             text=True,
@@ -161,12 +161,22 @@ def gpu_status() -> dict[str, Any]:
             util_pct = float(util)
         except ValueError:
             continue
+
+        def _watts(value: str | None) -> float | None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):  # "[N/A]" on old drivers
+                return None
+
         gpus.append({
             "name": name,
             "memory_used_mib": used_mib,
             "memory_total_mib": total_mib,
             "memory_used_fraction": used_mib / total_mib if total_mib > 0 else None,
             "utilization_gpu_percent": util_pct,
+            # power draw vs limit: second utilization signal for the panel
+            "power_draw_w": _watts(parts[4] if len(parts) > 4 else None),
+            "power_limit_w": _watts(parts[5] if len(parts) > 5 else None),
         })
     used_sum = sum(gpu["memory_used_mib"] for gpu in gpus)
     total_sum = sum(gpu["memory_total_mib"] for gpu in gpus)

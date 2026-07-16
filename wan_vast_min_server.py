@@ -60,6 +60,16 @@ def gpu_status() -> dict[str, Any]:
             out["utilization_gpu_pct"] = float(torch.cuda.utilization(0))
         except Exception:  # noqa: BLE001
             pass
+        # Power draw vs limit: a second utilization signal (SM% can read 100
+        # while the chip coasts; a power-capped GPU pins draw at the limit).
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            out["power_draw_w"] = round(pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0, 1)
+            out["power_limit_w"] = round(pynvml.nvmlDeviceGetEnforcedPowerLimit(handle) / 1000.0, 1)
+        except Exception:  # noqa: BLE001
+            pass
         return out
     except Exception as exc:  # noqa: BLE001
         return {"cuda": False, "error": str(exc)}
