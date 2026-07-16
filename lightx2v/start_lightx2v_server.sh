@@ -17,4 +17,4 @@ exec python -m lightx2v.server \
   --task t2v \
   --host 127.0.0.1 \
   --port "$PORT" \
-  --config_json "$BASE_DIR/lx2v_t2v.json"
+  --config_json "${LX2V_CONFIG:-$BASE_DIR/lx2v_t2v.json}"

@@ -27,11 +27,17 @@ mkdir -p "$SP/flash_attn"
 cp "$HERE/flash_attn_stub.py" "$SP/flash_attn/__init__.py"
 cp "$HERE/flash_attn_stub.py" "$SP/flash_attn/flash_attn_interface.py"
 mkdir -p "$MODELS"
+# The bf16 DiT experts (high/low_noise_model, ~56GB) serve only the bf16
+# block-offload path. The NVFP4 path (setup_nvfp4_sm120.sh) ships its own
+# ~18GB quantized experts, so skip the 56GB download when LX2V_SKIP_BF16_DIT=1
+# -- only the shared T5/VAE/config are needed then.
+DIT_PATTERNS='"high_noise_model/*", "low_noise_model/*",'
+if [ "${LX2V_SKIP_BF16_DIT:-0}" = "1" ]; then DIT_PATTERNS=''; echo "skipping bf16 DiT experts (NVFP4 path)"; fi
 python3 - <<PYEOF
 from huggingface_hub import snapshot_download
 snapshot_download("Wan-AI/Wan2.2-T2V-A14B",
                   allow_patterns=["models_t5*", "*VAE*", "google/*", "*.json", "*.txt",
-                                  "high_noise_model/*", "low_noise_model/*"],
+                                  $DIT_PATTERNS],
                   local_dir="$MODELS/Wan2.2-T2V-A14B")
 snapshot_download("lightx2v/Wan2.2-Distill-Loras", allow_patterns=["*t2v*"],
                   local_dir="$MODELS/Wan2.2-Distill-Loras")
