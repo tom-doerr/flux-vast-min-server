@@ -22,28 +22,28 @@ MAX_JOBS="${MAX_JOBS:-32}" TORCH_CUDA_ARCH_LIST="12.0a" CUTLASS_PATH="$CUTLASS_P
   pip install --no-cache-dir --no-build-isolation \
     --config-settings=cmake.define.CUTLASS_PATH="$CUTLASS_PATH" \
     "$BASE_DIR/LightX2V/lightx2v_kernel"
-python3 -c "import lightx2v_kernel"  # loud failure if the build didn't land
+python3 -c "import torch, lightx2v_kernel"  # torch first: libtorch.so is only on the loader path after torch loads
 
 # Attention kernels for the fast path (benchmarked Jul 19 2026 on a 5090:
 # 480p 29s->11s, 720p 49s->27.7s vs the old all-torch_sdpa config).
 # SageAttention: cross-attn sage_attn2; builds for sm_120 as-is upstream.
 pip install --no-cache-dir pyzmq soundfile sentencepiece librosa
-if ! python3 -c "import sageattention._fused" 2>/dev/null; then
+if ! python3 -c "import torch, sageattention._fused" 2>/dev/null; then
   pip uninstall -y sageattention 2>/dev/null || true
   [ -d "$BASE_DIR/SageAttention" ] || git clone --depth 1 https://github.com/thu-ml/SageAttention.git "$BASE_DIR/SageAttention"
   (cd "$BASE_DIR/SageAttention" && TORCH_CUDA_ARCH_LIST="12.0" EXT_PARALLEL=4     NVCC_APPEND_FLAGS="--threads 8" MAX_JOBS="${MAX_JOBS:-32}"     pip install --no-cache-dir --no-build-isolation .)
 fi
-(cd / && python3 -c "import sageattention._fused; print('sageattention CUDA OK')")
+(cd / && python3 -c "import torch, sageattention._fused; print('sageattention CUDA OK')")
 # SpargeAttn (spas_sage_attn): the sage2 block-sparse self-attn kernels. Its
 # setup.py WHITELIST is the only sm_120 blocker -- the sm89 fp8 kernels
 # compile and run correctly on Blackwell (clips verified real content).
-if ! python3 -c "import spas_sage_attn" 2>/dev/null; then
+if ! python3 -c "import torch, spas_sage_attn" 2>/dev/null; then
   [ -d "$BASE_DIR/SpargeAttn" ] || git clone --depth 1 https://github.com/thu-ml/SpargeAttn.git "$BASE_DIR/SpargeAttn"
   sed -i 's/SUPPORTED_ARCHS = {"8.0", "8.6", "8.7", "8.9", "9.0"}/SUPPORTED_ARCHS = {"8.0", "8.6", "8.7", "8.9", "9.0", "12.0"}/'     "$BASE_DIR/SpargeAttn/setup.py"
   grep -q '"12.0"' "$BASE_DIR/SpargeAttn/setup.py"  # loud if upstream moved the whitelist
   (cd "$BASE_DIR/SpargeAttn" && TORCH_CUDA_ARCH_LIST="12.0" EXT_PARALLEL=4     NVCC_APPEND_FLAGS="--threads 8" MAX_JOBS="${MAX_JOBS:-32}"     pip install --no-cache-dir --no-build-isolation .)
 fi
-(cd / && python3 -c "import spas_sage_attn; print('spas_sage_attn OK')")
+(cd / && python3 -c "import torch, spas_sage_attn; print('spas_sage_attn OK')")
 
 python3 - <<PYEOF
 from huggingface_hub import snapshot_download
