@@ -4,7 +4,9 @@
 # imports flash_attn unconditionally in unused subsystems), and downloads the
 # Wan2.2 T2V base weights + 4-step distill LoRAs. Safe to re-run.
 set -euo pipefail
-LX2V_REF="00c9da5ee7b2bfd7b13e79a367f2a23eaba04c8a"
+# Bumped Jul 19 2026 for dynamic_sparse_attn (sage2 operator): the sparse
+# self-attention era that benchmarked 11s/480p, 27.7s/720p on a 5090.
+LX2V_REF="7314b455623f71838a30c1a2a70c5f96fd7be0de"
 BASE_DIR="${LX2V_BASE_DIR:-/workspace}"
 MODELS="$BASE_DIR/models"
 HERE="$(cd "$(dirname "$0")" && pwd)"
