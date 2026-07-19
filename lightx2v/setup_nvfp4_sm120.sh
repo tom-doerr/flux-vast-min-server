@@ -13,7 +13,8 @@ MODELS="$BASE_DIR/models"
 # CUTLASS: the kernel's CMake demands an explicit path (no vendored copy).
 CUTLASS_PATH="${CUTLASS_PATH:-/opt/pytorch/ao/third_party/cutlass}"
 if [ ! -d "$CUTLASS_PATH" ]; then
-  git clone --depth 1 https://github.com/NVIDIA/cutlass.git "$BASE_DIR/cutlass"
+  # idempotent: a rerun after a mid-setup failure finds the clone already there
+  [ -d "$BASE_DIR/cutlass" ] || git clone --depth 1 https://github.com/NVIDIA/cutlass.git "$BASE_DIR/cutlass"
   CUTLASS_PATH="$BASE_DIR/cutlass"
 fi
 
