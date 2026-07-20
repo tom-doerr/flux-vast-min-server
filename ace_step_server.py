@@ -101,6 +101,11 @@ class AceRuntime:
         self._pipe: Any = None
         self._lock = threading.Lock()
         self._model_id = DEFAULT_MODEL
+        # CLAP audio embedder for on-box ridge/diversity (kind='audio'), mirrors
+        # the wan box's VideoMAE embedder. Loaded lazily, separate from ACE-Step.
+        self._embedder: Any = None
+        self._embed_lock = threading.Lock()
+        self._embed_model_id = os.environ.get("ACE_EMBED_MODEL", "laion/clap-htsat-unfused")
 
     def preload(self, model_id: str = "") -> str:
         self._load()
@@ -122,6 +127,58 @@ class AceRuntime:
             )
             print(f"loaded ACE-Step ({self.dtype})", flush=True)
             return self._pipe
+
+    def _resolve_audio_path(self, payload: dict[str, Any]) -> Path:
+        import base64
+        if payload.get("audio_b64"):
+            raw = base64.b64decode(payload["audio_b64"])
+            tmp = self.output_dir / f"embed_{int(time.time() * 1000)}.wav"
+            tmp.write_bytes(raw)
+            return tmp
+        job_id = payload.get("job_id")
+        if job_id is not None:
+            candidate = self.output_dir / f"job_{int(job_id):06d}.wav"
+            if candidate.exists():
+                return candidate
+        raise ValueError("embed requires job_id (with a ready wav) or audio_b64")
+
+    def _load_embedder(self) -> Any:
+        if self._embedder is not None:
+            return self._embedder
+        import torch
+        from transformers import ClapModel, ClapProcessor
+
+        proc = ClapProcessor.from_pretrained(self._embed_model_id)
+        model = ClapModel.from_pretrained(self._embed_model_id)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._embedder = (model.to(device).eval(), proc)
+        print(f"loaded CLAP embedder {self._embed_model_id}", flush=True)
+        return self._embedder
+
+    def embed(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """On-box CLAP audio embedding (kind='audio'). Raises on failure -- no
+        silent zero vector (parity with the wan/video embedder)."""
+        import numpy as np
+        import soundfile as sf
+        import torch
+
+        wav_path = self._resolve_audio_path(payload)
+        audio, sr = sf.read(str(wav_path), dtype="float32")
+        if getattr(audio, "ndim", 1) > 1:
+            audio = audio.mean(axis=1)  # mono
+        target_sr = 48000
+        if sr != target_sr:
+            import torchaudio
+            audio = torchaudio.functional.resample(
+                torch.from_numpy(np.ascontiguousarray(audio)), sr, target_sr).numpy()
+        with self._embed_lock:
+            model, proc = self._load_embedder()
+            inputs = proc(audios=audio, sampling_rate=target_sr, return_tensors="pt")
+            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+            with torch.no_grad():
+                feats = model.get_audio_features(**inputs)
+            vec = feats[0].float().cpu().tolist()
+        return {"embedding": vec, "dims": len(vec), "model": self._embed_model_id}
 
     def generate(self, job: Job) -> None:
         pipe = self._load()
@@ -261,7 +318,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True, "loaded": rt._pipe is not None,
                                "preloading": self.state.preloading,
                                "preload_error": self.state.preload_error,
-                               "model": rt._model_id,
+                               "model": rt._model_id, "embed_model": rt._embed_model_id,
                                **self.state.status(), "gpu": gpu_status()})
         if path == "/jobs":
             query = parse_qs(parsed.query)
@@ -305,6 +362,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/generate/enqueue":
             job = self.state.enqueue(payload)
             return self._json({"id": job.id, "status": job.status})
+        if path == "/embed":
+            try:
+                return self._json(self.state.runtime.embed(payload))
+            except Exception as exc:  # noqa: BLE001
+                return self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
         return self._json({"error": "not found"}, 404)
 
 
