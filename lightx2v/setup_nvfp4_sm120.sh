@@ -10,6 +10,26 @@ set -euo pipefail
 BASE_DIR="${LX2V_BASE_DIR:-/workspace}"
 MODELS="$BASE_DIR/models"
 
+# Fast path: a prebuilt wheel tarball (harvested from a verified box) skips
+# ~25 min of nvcc across SageAttention + SpargeAttn + lightx2v_kernel. The
+# untarred packages are ABI-pinned to torch 2.8.0+cu128 / py3.10, which is
+# exactly what setup_lightx2v.sh installs; if the imports don't land (torch
+# mismatch, corrupt download) we fall through to the source builds below.
+# Opt out with LX2V_SKIP_PREBUILT=1.
+PREBUILT_URL="${LX2V_PREBUILT_URL:-https://github.com/tom-doerr/flux-vast-min-server/releases/download/sm120-attn-torch2.8.0cu128/sm120_attention_pkgs_torch2.8.0cu128.tar.gz}"
+if [ "${LX2V_SKIP_PREBUILT:-0}" != "1" ] && \
+   ! python3 -c "import torch, spas_sage_attn, sageattention._fused, lightx2v_kernel" 2>/dev/null; then
+  SP="$(python3 -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null)"
+  if [ -n "$SP" ] && curl -fsSL -m 300 "$PREBUILT_URL" -o /tmp/sm120_attn.tar.gz; then
+    tar xzf /tmp/sm120_attn.tar.gz -C "$SP" && rm -f /tmp/sm120_attn.tar.gz
+    if python3 -c "import torch, spas_sage_attn, sageattention._fused, lightx2v_kernel" 2>/dev/null; then
+      echo "prebuilt sm_120 attention stack installed from release (skipped source builds)"
+    else
+      echo "prebuilt tarball imports failed; falling through to source builds"
+    fi
+  fi
+fi
+
 # CUTLASS: the kernel's CMake demands an explicit path (no vendored copy).
 CUTLASS_PATH="${CUTLASS_PATH:-/opt/pytorch/ao/third_party/cutlass}"
 if [ ! -d "$CUTLASS_PATH" ]; then
