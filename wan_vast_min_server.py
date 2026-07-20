@@ -91,15 +91,17 @@ def _frame_to_pil(frame: Any):
 
 @dataclass
 class VideoRecord:
-    path: Path            # mp4
+    path: Path            # mp4 (original, 16fps)
     keyframe_path: Path   # png
     width: int
     height: int
     num_frames: int
     fps: int
+    rife_path: Path | None = None   # 128fps 8x RIFE clip, when interpolation succeeded
+    rife_fps: int = 0
 
     def payload(self, job_id: int, index: int = 0) -> dict[str, Any]:
-        return {
+        data = {
             "index": index,
             "video_url": f"/jobs/{job_id}/videos/{index}",
             "keyframe_url": f"/jobs/{job_id}/videos/{index}/keyframe",
@@ -108,6 +110,10 @@ class VideoRecord:
             "num_frames": self.num_frames,
             "fps": self.fps,
         }
+        if self.rife_path is not None:
+            data["rife_url"] = f"/jobs/{job_id}/videos/{index}/rife"
+            data["rife_fps"] = self.rife_fps
+        return data
 
 
 @dataclass
@@ -146,6 +152,11 @@ class WanRuntime:
         self.offload = offload
         self.runtime = runtime  # 'diffusers' (in-process) | 'lightx2v' (proxy)
         self.lightx2v_url = lightx2v_url.rstrip("/")
+        # RIFE 8x frame interpolation (Practical-RIFE, vendored under rife/).
+        # Runs in-process after every render: 16fps -> 128fps. Enabled by
+        # default; failure is non-fatal (the original clip still ships).
+        self.rife_enabled = os.environ.get("WAN_RIFE", "1") not in ("0", "false", "no", "")
+        self.rife_multi = int(os.environ.get("WAN_RIFE_MULTI", "8"))
         self._model_id = model_id
         self._embed_model_id = embed_model
         self._pipe = None
@@ -239,6 +250,30 @@ class WanRuntime:
             raise RuntimeError("lightx2v result has no decodable frames")
         _frame_to_pil(frames[len(frames) // 2]).save(keyframe_path)
         job.videos = [VideoRecord(mp4_path, keyframe_path, width, height, num_frames, fps)]
+        self._apply_rife(job.videos[0])
+
+    def _apply_rife(self, rec: "VideoRecord") -> None:
+        """In-process RIFE 8x interpolation (16fps -> 128fps). Non-fatal: on
+        failure the original clip is still served -- but log LOUDLY so a
+        missing interpolation is visible, never silently swallowed."""
+        if not self.rife_enabled:
+            return
+        try:
+            import time
+            import rife_interp
+            out = rec.path.with_name(rec.path.stem + ".rife.mp4")
+            out_fps = int(rec.fps * self.rife_multi)
+            t0 = time.time()
+            stats = rife_interp.interpolate_file(
+                str(rec.path), str(out), multi=self.rife_multi, out_fps=out_fps)
+            rec.rife_path = out
+            rec.rife_fps = out_fps
+            print(f"[rife] {rec.path.name} -> {out.name} {stats} "
+                  f"{time.time() - t0:.1f}s", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            import traceback
+            print(f"[rife] FAILED for {rec.path.name} (serving original only): "
+                  f"{exc}\n{traceback.format_exc()}", flush=True)
 
     def _lx2v(self, method: str, path: str, payload: dict | None = None, timeout: float = 60):
         import urllib.request
@@ -279,6 +314,7 @@ class WanRuntime:
         keyframe_path = base.with_suffix(".png")
         _frame_to_pil(frames[len(frames) // 2]).save(keyframe_path)
         job.videos = [VideoRecord(mp4_path, keyframe_path, width, height, num_frames, fps)]
+        self._apply_rife(job.videos[0])
 
     def _load_embedder(self):
         import torch
@@ -490,6 +526,10 @@ class Handler(BaseHTTPRequestHandler):
             rec = job.videos[idx]
             if len(parts) >= 5 and parts[4] == "keyframe":
                 return self._bytes(rec.keyframe_path.read_bytes(), "image/png")
+            if len(parts) >= 5 and parts[4] == "rife":
+                if rec.rife_path is None or not rec.rife_path.exists():
+                    return self._json({"error": "rife not available"}, 404)
+                return self._bytes(rec.rife_path.read_bytes(), "video/mp4")
             return self._bytes(rec.path.read_bytes(), "video/mp4")
         return self._json({"error": "not found"}, 404)
 
