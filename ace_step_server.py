@@ -36,6 +36,46 @@ def _wav_info(path: Path) -> tuple[float, int]:
     return (float(info.frames) / float(info.samplerate), int(info.samplerate))
 
 
+def _to_pcm16(path: Path) -> None:
+    """Re-encode a wav IN PLACE to 16-bit PCM. ACE-Step writes 32-bit FLOAT wav,
+    which most browsers cannot decode (Firefox not at all, Chrome only recently);
+    16-bit PCM plays everywhere and is lossless-enough for listening."""
+    import soundfile as sf
+
+    if sf.info(str(path)).subtype == "PCM_16":
+        return
+    audio, sr = sf.read(str(path), dtype="float32")
+    sf.write(str(path), audio, sr, subtype="PCM_16")
+
+
+def _waveform_png(wav_path: Path, out_path: Path, width: int = 900, height: int = 180) -> None:
+    """Render a peak-envelope waveform PNG (dark bg, green trace) from a wav so
+    an audio card has a visual. Raises on failure (caller logs, non-fatal)."""
+    import numpy as np
+    import soundfile as sf
+    from PIL import Image, ImageDraw
+
+    audio, _sr = sf.read(str(wav_path), dtype="float32")
+    if getattr(audio, "ndim", 1) > 1:
+        audio = audio.mean(axis=1)
+    n = len(audio)
+    if n == 0:
+        raise RuntimeError("empty audio for waveform")
+    step = max(1, n // width)
+    peak = float(np.max(np.abs(audio))) or 1.0
+    img = Image.new("RGB", (width, height), (11, 18, 32))
+    draw = ImageDraw.Draw(img)
+    mid = height // 2
+    for x in range(width):
+        chunk = audio[x * step:(x + 1) * step]
+        if len(chunk) == 0:
+            continue
+        hi = int(float(np.max(chunk)) / peak * (mid - 2))
+        lo = int(float(np.min(chunk)) / peak * (mid - 2))
+        draw.line([(x, mid - hi), (x, mid - lo)], fill=(74, 222, 128), width=1)
+    img.save(str(out_path))
+
+
 def gpu_status() -> dict[str, Any]:
     try:
         import subprocess
@@ -57,14 +97,18 @@ class AudioRecord:
     path: Path            # wav
     duration: float
     sample_rate: int
+    waveform_path: Path | None = None   # peak-envelope PNG, when rendered
 
     def payload(self, job_id: int, index: int = 0) -> dict[str, Any]:
-        return {
+        data = {
             "index": index,
             "audio_url": f"/jobs/{job_id}/audio/{index}",
             "duration": self.duration,
             "sample_rate": self.sample_rate,
         }
+        if self.waveform_path is not None:
+            data["waveform_url"] = f"/jobs/{job_id}/audio/{index}/waveform"
+        return data
 
 
 @dataclass
@@ -205,8 +249,16 @@ class AceRuntime:
         wav = Path(out[0]) if isinstance(out, (list, tuple)) and out else Path(save_path)
         if not (wav.exists() and wav.stat().st_size > 0):
             raise RuntimeError(f"ACE-Step produced no audio for job {job.id}")
+        _to_pcm16(wav)  # ACE-Step writes 32-bit float; make it browser-playable
         dur, sr = _wav_info(wav)
-        job.audios = [AudioRecord(wav, dur, sr)]
+        rec = AudioRecord(wav, dur, sr)
+        waveform = wav.with_name(wav.stem + ".waveform.png")
+        try:
+            _waveform_png(wav, waveform)
+            rec.waveform_path = waveform
+        except Exception as exc:  # noqa: BLE001 -- visual is non-fatal
+            print(f"[ace] waveform failed job {job.id}: {exc}", flush=True)
+        job.audios = [rec]
         print(f"[ace] job {job.id} -> {wav.name} {dur:.1f}s @ {sr}Hz "
               f"{time.time() - t0:.1f}s", flush=True)
 
@@ -346,7 +398,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "bad audio index"}, 400)
             if idx < 0 or idx >= len(job.audios):
                 return self._json({"error": "audio not ready"}, 404)
-            return self._bytes(job.audios[idx].path.read_bytes(), "audio/wav")
+            rec = job.audios[idx]
+            if len(parts) >= 5 and parts[4] == "waveform":
+                if rec.waveform_path is None or not rec.waveform_path.exists():
+                    return self._json({"error": "waveform not available"}, 404)
+                return self._bytes(rec.waveform_path.read_bytes(), "image/png")
+            return self._bytes(rec.path.read_bytes(), "audio/wav")
         return self._json({"error": "not found"}, 404)
 
     def do_POST(self) -> None:  # noqa: N802
