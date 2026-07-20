@@ -18,6 +18,14 @@ if [ ! -d "$CUTLASS_PATH" ]; then
   CUTLASS_PATH="$BASE_DIR/cutlass"
 fi
 
+# SpargeAttn's setup.py generates its kernel instantiations via
+# os.system("python autogen.py") -- BARE python, exit code ignored. Without
+# a `python` binary the generation silently no-ops and the build links an
+# extension referencing 120 kernels with ZERO definitions (undefined
+# SpargeAttentionSM89Dispatched... at import). The lightx2v server launcher
+# uses bare `python` too. Plain CUDA images ship only python3.
+command -v python >/dev/null 2>&1 || ln -sf "$(command -v python3)" /usr/local/bin/python
+
 pip install --no-cache-dir scikit-build-core cmake ninja
 MAX_JOBS="${MAX_JOBS:-32}" TORCH_CUDA_ARCH_LIST="12.0a" CUTLASS_PATH="$CUTLASS_PATH" \
   pip install --no-cache-dir --no-build-isolation \
