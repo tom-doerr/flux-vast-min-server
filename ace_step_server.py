@@ -313,7 +313,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="ACE-Step music generation server")
     parser.add_argument("--host", default=os.environ.get("ACE_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("ACE_PORT", "8920")))
-    parser.add_argument("--output-dir", default=os.environ.get("ACE_OUTPUT_DIR", "/data/out_music/ace-vast-min"))
+    parser.add_argument("--output-dir", default=os.environ.get("ACE_OUTPUT_DIR", "/workspace/ace_out"))
     parser.add_argument("--checkpoint-dir", default=os.environ.get("ACE_CHECKPOINT_DIR", ""))
     parser.add_argument("--dtype", default=os.environ.get("ACE_DTYPE", "bfloat16"))
     parser.add_argument("--cpu-offload", action="store_true", default=os.environ.get("ACE_CPU_OFFLOAD", "") not in ("", "0", "false"))
