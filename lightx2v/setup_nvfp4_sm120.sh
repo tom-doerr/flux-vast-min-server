@@ -42,7 +42,11 @@ if ! python3 -c "import torch, spas_sage_attn" 2>/dev/null; then
   [ -d "$BASE_DIR/SpargeAttn" ] || git clone --depth 1 https://github.com/thu-ml/SpargeAttn.git "$BASE_DIR/SpargeAttn"
   sed -i 's/SUPPORTED_ARCHS = {"8.0", "8.6", "8.7", "8.9", "9.0"}/SUPPORTED_ARCHS = {"8.0", "8.6", "8.7", "8.9", "9.0", "12.0"}/'     "$BASE_DIR/SpargeAttn/setup.py"
   grep -q '"12.0"' "$BASE_DIR/SpargeAttn/setup.py"  # loud if upstream moved the whitelist
-  (cd "$BASE_DIR/SpargeAttn" && TORCH_CUDA_ARCH_LIST="12.0" EXT_PARALLEL=4     NVCC_APPEND_FLAGS="--threads 8" MAX_JOBS="${MAX_JOBS:-32}"     pip install --no-cache-dir --no-build-isolation .)
+  # NO EXT_PARALLEL: it raced SpargeAttn's extension link and produced a
+  # _qattn.so missing sm89 instantiation symbols (undefined symbol
+  # SpargeAttentionSM89Dispatched... at import) on 2 of 3 builds. MAX_JOBS
+  # still parallelizes the per-TU compile safely.
+  (cd "$BASE_DIR/SpargeAttn" && TORCH_CUDA_ARCH_LIST="12.0" MAX_JOBS="${MAX_JOBS:-16}" pip install --no-cache-dir --no-build-isolation .)
 fi
 (cd / && python3 -c "import torch, spas_sage_attn; print('spas_sage_attn OK')")
 
