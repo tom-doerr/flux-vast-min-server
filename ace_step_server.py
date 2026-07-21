@@ -150,6 +150,38 @@ class AceRuntime:
         self._embedder: Any = None
         self._embed_lock = threading.Lock()
         self._embed_model_id = os.environ.get("ACE_EMBED_MODEL", "laion/clap-htsat-unfused")
+        self._start_output_pruner()
+
+    def _start_output_pruner(self) -> None:
+        """Bound disk use: the app fetches each clip within seconds and stores it
+        in MinIO, so on-box outputs are disposable. Nothing pruned them and 5900
+        clips + one embed temp per clip filled the 80 GB box (music died with
+        LibsndfileError: System error). Delete files older than the retention
+        window every few minutes. ACE_OUTPUT_RETENTION_MIN=0 disables."""
+        retention_min = float(os.environ.get("ACE_OUTPUT_RETENTION_MIN", "20") or 0)
+        if retention_min <= 0:
+            return
+
+        def prune() -> None:
+            while True:
+                try:
+                    cutoff = time.time() - retention_min * 60
+                    removed = 0
+                    for f in self.output_dir.glob("*"):
+                        try:
+                            if f.is_file() and f.stat().st_mtime < cutoff:
+                                f.unlink()
+                                removed += 1
+                        except OSError:
+                            pass
+                    if removed:
+                        print(f"ace output pruner: removed {removed} files older "
+                              f"than {retention_min:.0f}m", flush=True)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"ace output pruner error: {exc}", flush=True)
+                time.sleep(300)
+
+        threading.Thread(target=prune, name="ace-output-pruner", daemon=True).start()
 
     def preload(self, model_id: str = "") -> str:
         self._load()
@@ -172,18 +204,21 @@ class AceRuntime:
             print(f"loaded ACE-Step ({self.dtype})", flush=True)
             return self._pipe
 
-    def _resolve_audio_path(self, payload: dict[str, Any]) -> Path:
+    def _resolve_audio_path(self, payload: dict[str, Any]) -> tuple[Path, bool]:
+        """Returns (wav_path, is_temp). is_temp files are the app's uploaded
+        audio_b64 written to disk only so soundfile can read them -- they MUST be
+        deleted after embedding (one per clip at ~11 MB filled the 80 GB box)."""
         import base64
         if payload.get("audio_b64"):
             raw = base64.b64decode(payload["audio_b64"])
             tmp = self.output_dir / f"embed_{int(time.time() * 1000)}.wav"
             tmp.write_bytes(raw)
-            return tmp
+            return tmp, True
         job_id = payload.get("job_id")
         if job_id is not None:
             candidate = self.output_dir / f"job_{int(job_id):06d}.wav"
             if candidate.exists():
-                return candidate
+                return candidate, False
         raise ValueError("embed requires job_id (with a ready wav) or audio_b64")
 
     def _load_embedder(self) -> Any:
@@ -206,23 +241,30 @@ class AceRuntime:
         import soundfile as sf
         import torch
 
-        wav_path = self._resolve_audio_path(payload)
-        audio, sr = sf.read(str(wav_path), dtype="float32")
-        if getattr(audio, "ndim", 1) > 1:
-            audio = audio.mean(axis=1)  # mono
-        target_sr = 48000
-        if sr != target_sr:
-            import torchaudio
-            audio = torchaudio.functional.resample(
-                torch.from_numpy(np.ascontiguousarray(audio)), sr, target_sr).numpy()
-        with self._embed_lock:
-            model, proc = self._load_embedder()
-            inputs = proc(audios=audio, sampling_rate=target_sr, return_tensors="pt")
-            inputs = {k: v.to(model.device) for k, v in inputs.items()}
-            with torch.no_grad():
-                feats = model.get_audio_features(**inputs)
-            vec = feats[0].float().cpu().tolist()
-        return {"embedding": vec, "dims": len(vec), "model": self._embed_model_id}
+        wav_path, is_temp = self._resolve_audio_path(payload)
+        try:
+            audio, sr = sf.read(str(wav_path), dtype="float32")
+            if getattr(audio, "ndim", 1) > 1:
+                audio = audio.mean(axis=1)  # mono
+            target_sr = 48000
+            if sr != target_sr:
+                import torchaudio
+                audio = torchaudio.functional.resample(
+                    torch.from_numpy(np.ascontiguousarray(audio)), sr, target_sr).numpy()
+            with self._embed_lock:
+                model, proc = self._load_embedder()
+                inputs = proc(audios=audio, sampling_rate=target_sr, return_tensors="pt")
+                inputs = {k: v.to(model.device) for k, v in inputs.items()}
+                with torch.no_grad():
+                    feats = model.get_audio_features(**inputs)
+                vec = feats[0].float().cpu().tolist()
+            return {"embedding": vec, "dims": len(vec), "model": self._embed_model_id}
+        finally:
+            if is_temp:
+                try:
+                    wav_path.unlink()
+                except OSError:
+                    pass
 
     def generate(self, job: Job) -> None:
         pipe = self._load()
