@@ -24,6 +24,9 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 DEFAULT_MODEL = "ACE-Step/ACE-Step-v1-3.5B"
+# ACE-Step 1.5 (diffusers AceStepPipeline): XL SFT = commercial-grade, stereo
+# 48kHz, LM-planner-assisted long-range structure. Loaded via --engine v15.
+DEFAULT_MODEL_V15 = "ACE-Step/acestep-v15-xl-sft-diffusers"
 STATE: "AppState | None" = None
 
 
@@ -135,16 +138,18 @@ class Job:
 
 class AceRuntime:
     def __init__(self, *, output_dir: Path, checkpoint_dir: str, dtype: str = "bfloat16",
-                 cpu_offload: bool = False, torch_compile: bool = False) -> None:
+                 cpu_offload: bool = False, torch_compile: bool = False,
+                 engine: str = "v1", model_id: str = "") -> None:
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_dir = checkpoint_dir
         self.dtype = dtype
         self.cpu_offload = cpu_offload
         self.torch_compile = torch_compile
+        self.engine = engine
         self._pipe: Any = None
         self._lock = threading.Lock()
-        self._model_id = DEFAULT_MODEL
+        self._model_id = model_id or (DEFAULT_MODEL_V15 if engine == "v15" else DEFAULT_MODEL)
         # CLAP audio embedder for on-box ridge/diversity (kind='audio'), mirrors
         # the wan box's VideoMAE embedder. Loaded lazily, separate from ACE-Step.
         self._embedder: Any = None
@@ -190,6 +195,13 @@ class AceRuntime:
     def _load(self) -> Any:
         with self._lock:
             if self._pipe is not None:
+                return self._pipe
+            if self.engine == "v15":
+                import torch
+                from diffusers import AceStepPipeline
+                dtype = torch.bfloat16 if self.dtype == "bfloat16" else torch.float16
+                self._pipe = AceStepPipeline.from_pretrained(self._model_id, dtype=dtype).to("cuda")
+                print(f"loaded ACE-Step 1.5 ({self._model_id}, {self.dtype})", flush=True)
                 return self._pipe
             from acestep.pipeline_ace_step import ACEStepPipeline
 
@@ -253,10 +265,19 @@ class AceRuntime:
                     torch.from_numpy(np.ascontiguousarray(audio)), sr, target_sr).numpy()
             with self._embed_lock:
                 model, proc = self._load_embedder()
-                inputs = proc(audios=audio, sampling_rate=target_sr, return_tensors="pt")
+                # transformers 5.x renamed the ClapProcessor kwarg audios -> audio.
+                try:
+                    inputs = proc(audio=audio, sampling_rate=target_sr, return_tensors="pt")
+                except TypeError:
+                    inputs = proc(audios=audio, sampling_rate=target_sr, return_tensors="pt")
                 inputs = {k: v.to(model.device) for k, v in inputs.items()}
                 with torch.no_grad():
                     feats = model.get_audio_features(**inputs)
+                # 5.x may return a ModelOutput instead of a bare tensor.
+                if hasattr(feats, "pooler_output") and feats.pooler_output is not None:
+                    feats = feats.pooler_output
+                elif hasattr(feats, "audio_embeds") and feats.audio_embeds is not None:
+                    feats = feats.audio_embeds
                 vec = feats[0].float().cpu().tolist()
             return {"embedding": vec, "dims": len(vec), "model": self._embed_model_id}
         finally:
@@ -273,22 +294,43 @@ class AceRuntime:
         lyrics = str(p.get("lyrics") or "[instrumental]")
         save_path = str(self.output_dir / f"job_{job.id:06d}.wav")
         t0 = time.time()
-        with self._lock:
-            out = pipe(
-                format="wav",
-                audio_duration=float(p.get("audio_duration", 60.0)),
-                prompt=prompt,
-                lyrics=lyrics,
-                infer_step=int(p.get("infer_step", 60)),
-                guidance_scale=float(p.get("guidance_scale", 15.0)),
-                scheduler_type=str(p.get("scheduler_type", "euler")),
-                cfg_type=str(p.get("cfg_type", "apg")),
-                omega_scale=float(p.get("omega_scale", 10.0)),
-                manual_seeds=p.get("manual_seeds"),
-                save_path=save_path,
-                batch_size=1,
-            )
-        wav = Path(out[0]) if isinstance(out, (list, tuple)) and out else Path(save_path)
+        if self.engine == "v15":
+            import soundfile as sf
+            # v1.5 defaults: SFT wants ~30-60 steps, guidance 7 (APG), shift 3.
+            # A v1-era guidance (>10) from an un-updated client is reset, since
+            # 15 wrecks v1.5 output. Output is stereo 48kHz float.
+            g = float(p.get("guidance_scale", 7.0))
+            if g > 10.0:
+                g = 7.0
+            steps = int(p.get("infer_step", 40))
+            with self._lock:
+                audio = pipe(
+                    prompt=prompt,
+                    lyrics=lyrics,
+                    audio_duration=float(p.get("audio_duration", 30.0)),
+                    num_inference_steps=max(1, steps),
+                    guidance_scale=g,
+                    shift=float(p.get("shift", 3.0)),
+                ).audios
+            wav = Path(save_path)
+            sf.write(str(wav), audio[0].T.cpu().float().numpy(), pipe.sample_rate)
+        else:
+            with self._lock:
+                out = pipe(
+                    format="wav",
+                    audio_duration=float(p.get("audio_duration", 60.0)),
+                    prompt=prompt,
+                    lyrics=lyrics,
+                    infer_step=int(p.get("infer_step", 60)),
+                    guidance_scale=float(p.get("guidance_scale", 15.0)),
+                    scheduler_type=str(p.get("scheduler_type", "euler")),
+                    cfg_type=str(p.get("cfg_type", "apg")),
+                    omega_scale=float(p.get("omega_scale", 10.0)),
+                    manual_seeds=p.get("manual_seeds"),
+                    save_path=save_path,
+                    batch_size=1,
+                )
+            wav = Path(out[0]) if isinstance(out, (list, tuple)) and out else Path(save_path)
         if not (wav.exists() and wav.stat().st_size > 0):
             raise RuntimeError(f"ACE-Step produced no audio for job {job.id}")
         _to_pcm16(wav)  # ACE-Step writes 32-bit float; make it browser-playable
@@ -478,10 +520,13 @@ def main() -> int:
     parser.add_argument("--checkpoint-dir", default=os.environ.get("ACE_CHECKPOINT_DIR", ""))
     parser.add_argument("--dtype", default=os.environ.get("ACE_DTYPE", "bfloat16"))
     parser.add_argument("--cpu-offload", action="store_true", default=os.environ.get("ACE_CPU_OFFLOAD", "") not in ("", "0", "false"))
+    parser.add_argument("--engine", default=os.environ.get("ACE_ENGINE", "v1"), choices=["v1", "v15"])
+    parser.add_argument("--model", default=os.environ.get("ACE_MODEL", ""))
     args = parser.parse_args()
 
     runtime = AceRuntime(output_dir=Path(args.output_dir), checkpoint_dir=args.checkpoint_dir,
-                         dtype=args.dtype, cpu_offload=args.cpu_offload)
+                         dtype=args.dtype, cpu_offload=args.cpu_offload,
+                         engine=args.engine, model_id=args.model)
     STATE = AppState(runtime)
     STATE.start_preload()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
