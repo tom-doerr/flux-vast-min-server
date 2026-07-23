@@ -192,6 +192,24 @@ class AceRuntime:
         self._load()
         return self._model_id
 
+    def model_revision(self) -> str:
+        """The loaded checkpoint's HF snapshot sha (first 16 chars) = an exact
+        model hash for per-item provenance. Cached; local cache only (no net)."""
+        rev = getattr(self, "_model_revision_cache", None)
+        if rev is not None:
+            return rev
+        rev = ""
+        try:
+            from huggingface_hub import snapshot_download
+            p = snapshot_download(self._model_id, local_files_only=True).rstrip("/")
+            parts = p.split("/")
+            if "snapshots" in parts:
+                rev = parts[parts.index("snapshots") + 1][:16]
+        except Exception:
+            rev = ""
+        self._model_revision_cache = rev
+        return rev
+
     def _load(self) -> Any:
         with self._lock:
             if self._pipe is not None:
@@ -455,6 +473,8 @@ class Handler(BaseHTTPRequestHandler):
                                "preloading": self.state.preloading,
                                "preload_error": self.state.preload_error,
                                "model": rt._model_id, "embed_model": rt._embed_model_id,
+                               "runtime": rt.engine, "quant": rt.dtype,
+                               "model_revision": rt.model_revision(),
                                **self.state.status(), "gpu": gpu_status()})
         if path == "/jobs":
             query = parse_qs(parsed.query)
