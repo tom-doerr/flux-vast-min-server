@@ -210,17 +210,28 @@ class WanRuntime:
         """Proxy generation to a LightX2V server (NVFP4 step-distilled Wan2.2).
         guidance/cfg from the payload are IGNORED (the distilled model runs cfg
         off). infer_steps IS honoured within the distilled range: the LoRAs are
-        trained for 4 steps, 6-8 improves motion/detail. A distilled-plausible
-        `steps` (1..LIGHTX2V_MAX_STEPS) is forwarded as infer_steps; a
-        diffusers-scale value (e.g. the app's 40 default) falls back to 4."""
+        trained for 4 steps, 6-8 improves motion/detail. The dedicated
+        `distill_steps` field (1..LIGHTX2V_MAX_STEPS) is used; the app also sends
+        the full-model `steps` (its 40 diffusers default) which is IGNORED here
+        unless it is the only distilled-plausible value present (legacy clients)."""
         p = job.payload
         width = int(p.get("width") or DEFAULT_WIDTH)
         height = int(p.get("height") or DEFAULT_HEIGHT)
         num_frames = int(p.get("num_frames") or DEFAULT_NUM_FRAMES)
         fps = int(p.get("fps") or DEFAULT_FPS)
         seed = int(p.get("seed") or 42)
-        req_steps = int(p.get("steps") or 0)
-        infer_steps = req_steps if 1 <= req_steps <= LIGHTX2V_MAX_STEPS else LIGHTX2V_DEFAULT_STEPS
+        # Prefer the dedicated distilled-step setting (distill_steps). Fall back to
+        # a distilled-plausible legacy `steps` (old clients sent only that), else
+        # the default -- a diffusers-scale `steps` (the 40 full-model default) is
+        # NOT used for the distilled path.
+        distill = int(p.get("distill_steps") or 0)
+        legacy = int(p.get("steps") or 0)
+        if 1 <= distill <= LIGHTX2V_MAX_STEPS:
+            infer_steps = distill
+        elif 1 <= legacy <= LIGHTX2V_MAX_STEPS:
+            infer_steps = legacy
+        else:
+            infer_steps = LIGHTX2V_DEFAULT_STEPS
         name = f"job_{job.id:06d}.mp4"
         resp = self._lx2v("POST", "/v1/tasks/video/", {
             "prompt": str(p.get("prompt") or ""),
