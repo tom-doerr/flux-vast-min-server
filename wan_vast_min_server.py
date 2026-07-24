@@ -36,6 +36,13 @@ DEFAULT_HEIGHT = int(os.environ.get("WAN_HEIGHT", "720"))
 DEFAULT_NUM_FRAMES = int(os.environ.get("WAN_NUM_FRAMES", "81"))  # ~5s @16fps
 DEFAULT_FPS = int(os.environ.get("WAN_FPS", "16"))
 DEFAULT_STEPS = int(os.environ.get("WAN_STEPS", "40"))
+# Distilled-LoRA inference steps for the lightx2v path. The LoRAs are trained for
+# 4; 6-8 improves motion/detail (off-distribution but community-standard). The
+# app's `steps` setting also drives the diffusers path (20-50), so only a
+# distilled-plausible value (<= LIGHTX2V_MAX_STEPS) is honoured -- a
+# diffusers-scale value falls back to the default.
+LIGHTX2V_DEFAULT_STEPS = int(os.environ.get("WAN_LIGHTX2V_STEPS", "4"))
+LIGHTX2V_MAX_STEPS = int(os.environ.get("WAN_LIGHTX2V_MAX_STEPS", "16"))
 DEFAULT_GUIDANCE = float(os.environ.get("WAN_GUIDANCE", "5.0"))
 EMBED_FRAMES = int(os.environ.get("WAN_EMBED_FRAMES", "16"))  # VideoMAE clip length
 
@@ -201,15 +208,19 @@ class WanRuntime:
 
     def _generate_lightx2v(self, job: Job) -> None:
         """Proxy generation to a LightX2V server (NVFP4 step-distilled Wan2.2).
-        steps/guidance from the payload are IGNORED: the distilled model has a
-        fixed 4-step expert schedule and cfg disabled -- overriding them would
-        break quality. width/height/frames/fps/seed pass through."""
+        guidance/cfg from the payload are IGNORED (the distilled model runs cfg
+        off). infer_steps IS honoured within the distilled range: the LoRAs are
+        trained for 4 steps, 6-8 improves motion/detail. A distilled-plausible
+        `steps` (1..LIGHTX2V_MAX_STEPS) is forwarded as infer_steps; a
+        diffusers-scale value (e.g. the app's 40 default) falls back to 4."""
         p = job.payload
         width = int(p.get("width") or DEFAULT_WIDTH)
         height = int(p.get("height") or DEFAULT_HEIGHT)
         num_frames = int(p.get("num_frames") or DEFAULT_NUM_FRAMES)
         fps = int(p.get("fps") or DEFAULT_FPS)
         seed = int(p.get("seed") or 42)
+        req_steps = int(p.get("steps") or 0)
+        infer_steps = req_steps if 1 <= req_steps <= LIGHTX2V_MAX_STEPS else LIGHTX2V_DEFAULT_STEPS
         name = f"job_{job.id:06d}.mp4"
         resp = self._lx2v("POST", "/v1/tasks/video/", {
             "prompt": str(p.get("prompt") or ""),
@@ -218,6 +229,7 @@ class WanRuntime:
             "target_shape": [height, width],
             "target_video_length": num_frames,
             "target_fps": fps,
+            "infer_steps": infer_steps,
             "save_result_path": name,
         }, timeout=60)
         task_id = resp.get("task_id") or ""
