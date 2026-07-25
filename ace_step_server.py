@@ -477,6 +477,8 @@ class AppState:
 
     def _watchdog_loop(self, stall_s: float, idle_pct: float,
                        need_streak: int, every: float) -> None:
+        print(f"[ace-watchdog] armed: restart if a job stalls >{stall_s:.0f}s while "
+              f"gpu<{idle_pct:.0f}% for {need_streak} x {every:.0f}s checks", flush=True)
         while True:
             time.sleep(every)
             if self.preloading or self.runtime._pipe is None:
