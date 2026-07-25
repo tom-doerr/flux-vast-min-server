@@ -376,6 +376,10 @@ class AppState:
         self._worker.start()
         self.preloading = False
         self.preload_error = ""
+        self._started_at = time.time()
+        self._gpu_idle_streak = 0
+        if os.environ.get("ACE_WATCHDOG", "1") not in ("", "0", "false"):
+            threading.Thread(target=self._watchdog, name="ace-watchdog", daemon=True).start()
 
     def start_preload(self) -> None:
         self.preloading = True
@@ -437,6 +441,60 @@ class AppState:
                 print(f"[ace] job {job_id} FAILED: {job.error}\n{job.traceback}", flush=True)
             finally:
                 job.finished_at = time.time()
+
+    def _progress_snapshot(self) -> tuple[int, float, float]:
+        """(pending, oldest_running_age_s, since_last_progress_s), now-based.
+
+        pending = queued+running. oldest_running = age of the longest-running job
+        (the single worker processes one at a time, so this is the current job).
+        since_last_progress = seconds since any job last FINISHED (seeded with the
+        server start time so a fresh box is not flagged before its first clip).
+        """
+        now = time.time()
+        with self._lock:
+            jobs = list(self._jobs.values())
+        pending = sum(1 for j in jobs if j.status in ("queued", "running"))
+        running = [now - j.started_at for j in jobs if j.status == "running" and j.started_at]
+        oldest = max(running) if running else 0.0
+        finishes = [j.finished_at for j in jobs if j.finished_at]
+        last = max(finishes) if finishes else self._started_at
+        return pending, oldest, now - last
+
+    def _watchdog(self) -> None:
+        """Hard-restart the process when generation WEDGES: work is pending but
+        not progressing AND the GPU is idle -- the ace-worker thread hung
+        mid-render (a job stuck 'running' while the HTTP layer still answers
+        /health 200, so the box LOOKS up). os._exit lets the tmux `while true`
+        loop respawn us (model reload ~5s). False positives are guarded: a real
+        render pins the GPU, so the idle STREAK never accumulates; an idle box
+        has no pending work; model-load/self-restart is skipped.
+        """
+        stall_s = float(os.environ.get("ACE_WEDGE_STALL_S", "120"))
+        idle_pct = float(os.environ.get("ACE_WEDGE_GPU_UTIL_PCT", "5"))
+        need_streak = int(os.environ.get("ACE_WEDGE_IDLE_STREAK", "4"))
+        every = float(os.environ.get("ACE_WEDGE_CHECK_S", "20"))
+        self._watchdog_loop(stall_s, idle_pct, need_streak, every)
+
+    def _watchdog_loop(self, stall_s: float, idle_pct: float,
+                       need_streak: int, every: float) -> None:
+        while True:
+            time.sleep(every)
+            if self.preloading or self.runtime._pipe is None:
+                self._gpu_idle_streak = 0  # loading is not a wedge
+                continue
+            util = gpu_status().get("utilization_gpu_pct")
+            if util is None:  # can't read the GPU -> never guess a wedge
+                self._gpu_idle_streak = 0
+                continue
+            self._gpu_idle_streak = self._gpu_idle_streak + 1 if util < idle_pct else 0
+            pending, oldest_running, since_progress = self._progress_snapshot()
+            stalled = oldest_running > stall_s or (pending > 0 and since_progress > stall_s)
+            if stalled and self._gpu_idle_streak >= need_streak:
+                print(f"[ace-watchdog] WEDGED: pending={pending} "
+                      f"oldest_running={oldest_running:.0f}s since_progress={since_progress:.0f}s "
+                      f"gpu_idle_streak={self._gpu_idle_streak} (util={util}%) -> restart",
+                      flush=True)
+                os._exit(1)
 
 
 class Handler(BaseHTTPRequestHandler):
