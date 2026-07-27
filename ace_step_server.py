@@ -284,8 +284,13 @@ class AceRuntime:
             with self._embed_lock:
                 model, proc = self._load_embedder()
                 vec, nwin = self._embed_windows_mean(model, proc, audio, target_sr)
-            return {"embedding": vec, "dims": len(vec), "model": self._embed_model_id,
-                    "windows": nwin}
+            # Report a VERSIONED model id (base@mw{N}s) so multi-window vectors are
+            # stored NON-DESTRUCTIVELY (distinct from any single-window rows -- the
+            # embeddings PK includes `model`), with the windowing method explicit.
+            win_s = int(round(float(os.environ.get("ACE_EMBED_WINDOW_S", "10"))))
+            return {"embedding": vec, "dims": len(vec),
+                    "model": f"{self._embed_model_id}@mw{win_s}s",
+                    "windows": nwin, "method": "multiwindow_mean", "window_s": win_s}
         finally:
             if is_temp:
                 try:
