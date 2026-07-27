@@ -244,7 +244,9 @@ class Handler(BaseHTTPRequestHandler):
             if not STATE.rt.loaded:
                 return _json(self, 503, {"error": "model still preloading"})
             job = STATE.enqueue(body)
-            return _json(self, 200, {"job_id": job.id, "status": job.status})
+            # Return BOTH "id" (the idea_rank client contract -- enqueue_video
+            # parses .id, matching the Wan server) and "job_id" (older tools).
+            return _json(self, 200, {"id": job.id, "job_id": job.id, "status": job.status})
         if path == "/embed":
             try:
                 jid = body.get("job_id")
