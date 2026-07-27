@@ -283,27 +283,47 @@ class AceRuntime:
                     torch.from_numpy(np.ascontiguousarray(audio)), sr, target_sr).numpy()
             with self._embed_lock:
                 model, proc = self._load_embedder()
-                # transformers 5.x renamed the ClapProcessor kwarg audios -> audio.
-                try:
-                    inputs = proc(audio=audio, sampling_rate=target_sr, return_tensors="pt")
-                except TypeError:
-                    inputs = proc(audios=audio, sampling_rate=target_sr, return_tensors="pt")
-                inputs = {k: v.to(model.device) for k, v in inputs.items()}
-                with torch.no_grad():
-                    feats = model.get_audio_features(**inputs)
-                # 5.x may return a ModelOutput instead of a bare tensor.
-                if hasattr(feats, "pooler_output") and feats.pooler_output is not None:
-                    feats = feats.pooler_output
-                elif hasattr(feats, "audio_embeds") and feats.audio_embeds is not None:
-                    feats = feats.audio_embeds
-                vec = feats[0].float().cpu().tolist()
-            return {"embedding": vec, "dims": len(vec), "model": self._embed_model_id}
+                vec, nwin = self._embed_windows_mean(model, proc, audio, target_sr)
+            return {"embedding": vec, "dims": len(vec), "model": self._embed_model_id,
+                    "windows": nwin}
         finally:
             if is_temp:
                 try:
                     wav_path.unlink()
                 except OSError:
                     pass
+
+    def _embed_windows_mean(self, model, proc, audio, target_sr):
+        """CLAP mean over ceil(dur/10) NON-overlapping 10s windows (512-dim).
+        CLAP's extractor keeps only ~10s, so one call embeds ~10s of ANY clip --
+        fine for a 30s loop but ranks a 4-min track on a random ~4% of it.
+        Benchmarked (spark-3): 240s Spearman 0.178 (1 window) -> 0.32 (full
+        coverage); overlap/concat did NOT help. Dimension unchanged (drop-in)."""
+        import numpy as np
+        import torch
+        win = int(round(float(os.environ.get("ACE_EMBED_WINDOW_S", "10")) * target_sr))
+        n = int(len(audio))
+        starts = list(range(0, max(1, n - win + 1), win)) or [0]
+        if starts[-1] + win < n:
+            starts.append(max(0, n - win))   # cover the tail with a full window
+        segs = [np.pad(audio[s:s + win], (0, max(0, win - len(audio[s:s + win]))))[:win] for s in starts]
+        batch = int(os.environ.get("ACE_EMBED_WINDOW_BATCH", "16"))
+        vecs = []
+        for i in range(0, len(segs), batch):
+            part = segs[i:i + batch]
+            try:
+                inputs = proc(audio=part, sampling_rate=target_sr, return_tensors="pt")
+            except TypeError:
+                inputs = proc(audios=part, sampling_rate=target_sr, return_tensors="pt")
+            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+            with torch.no_grad():
+                feats = model.get_audio_features(**inputs)
+            if hasattr(feats, "pooler_output") and feats.pooler_output is not None:
+                feats = feats.pooler_output
+            elif hasattr(feats, "audio_embeds") and feats.audio_embeds is not None:
+                feats = feats.audio_embeds
+            vecs.append(feats.float().cpu().numpy())
+        return np.concatenate(vecs, 0).mean(axis=0).tolist(), len(segs)
 
     def generate(self, job: Job) -> None:
         pipe = self._load()
