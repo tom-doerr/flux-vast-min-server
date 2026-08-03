@@ -166,6 +166,15 @@ class WanRuntime:
         self.rife_multi = int(os.environ.get("WAN_RIFE_MULTI", "8"))
         self._model_id = model_id
         self._embed_model_id = embed_model
+        # Run the VideoMAE embedder on CPU by default so it does NOT contend with
+        # the render GPU. A fresh clip's embed is a small ViT forward, but on the
+        # GPU it queued behind an in-progress render (~50-60s) for compute cycles
+        # -- the dominant delay before a new clip got its ridge prediction. On CPU
+        # it runs CONCURRENTLY with renders (the GPU stays 100% on generation),
+        # a few seconds slower but off the critical GPU path, and it frees the
+        # ~350MB the embedder held in GPU memory. WAN_EMBED_DEVICE=cuda restores
+        # the old on-GPU behaviour.
+        self._embed_device = os.environ.get("WAN_EMBED_DEVICE", "cpu")
         self._pipe = None
         self._embedder = None
         self._embed_processor = None
@@ -347,8 +356,11 @@ class WanRuntime:
             # float32 for the small embedder: HF image processors emit float32
             # pixel_values, so a bf16 model trips a dtype mismatch.
             model = AutoModel.from_pretrained(self._embed_model_id)
-            if self.device.startswith("cuda") and torch.cuda.is_available():
-                model = model.to(self.device)
+            # Embedder device is independent of the render device: CPU by default
+            # so embeds run off the render GPU (see __init__). embed() moves inputs
+            # to model.device, so nothing else needs to change.
+            if self._embed_device.startswith("cuda") and torch.cuda.is_available():
+                model = model.to(self._embed_device)
             self._embedder = model.eval()
         return self._embedder, self._embed_processor
 
