@@ -226,11 +226,15 @@ class Handler(BaseHTTPRequestHandler):
                 d = {"id": job.id, "status": job.status, "error": job.error, **job.meta}
                 if job.mp4:
                     d["videos"] = [{"video_url": f"/jobs/{job.id}/videos/0",
-                                    "keyframe_url": f"/jobs/{job.id}/keyframe"}]
+                                    "keyframe_url": f"/jobs/{job.id}/videos/0/keyframe"}]
                 return _json(self, 200, d)
             if parts[2:] == ["videos", "0"] and job.mp4:
                 return _file(self, job.mp4, "video/mp4")
-            if parts[2:] == ["keyframe"] and job.keyframe:
+            # Canonical keyframe path matches the wan server + the app client
+            # (/jobs/{id}/videos/0/keyframe). The app fetched that and got 404
+            # ("not found", 22 bytes) here -> blank gallery posters. Keep the
+            # old /jobs/{id}/keyframe alias for backward compatibility.
+            if parts[2:] in (["videos", "0", "keyframe"], ["keyframe"]) and job.keyframe:
                 return _file(self, job.keyframe, "image/png")
         return _json(self, 404, {"error": "not found"})
 
