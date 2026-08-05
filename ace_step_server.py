@@ -318,7 +318,10 @@ class AceRuntime:
             part = segs[i:i + batch]
             try:
                 inputs = proc(audio=part, sampling_rate=target_sr, return_tensors="pt")
-            except TypeError:
+            except (TypeError, ValueError):
+                # transformers 4.50 ClapProcessor takes audios= (not audio=) and
+                # raises ValueError (not TypeError) on the unknown audio= kwarg, so
+                # catch both to fall through to the older keyword.
                 inputs = proc(audios=part, sampling_rate=target_sr, return_tensors="pt")
             inputs = {k: v.to(model.device) for k, v in inputs.items()}
             with torch.no_grad():
