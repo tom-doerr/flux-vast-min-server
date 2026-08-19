@@ -30,6 +30,37 @@ DEFAULT_MODEL_V15 = "ACE-Step/acestep-v15-xl-sft-diffusers"
 STATE: "AppState | None" = None
 
 
+ACE_SAMPLE_RATE = 48000
+
+
+def _normalize_repaint_spans(raw: Any) -> list[tuple[float, float]]:
+    """Accept [{start,end}] or [[start,end]] and validate hard.
+
+    The app merges and sorts spans before sending them (idea_rank's
+    infill_segments), so anything overlapping or backwards here means a client
+    bypassed that -- worth failing on rather than repainting a span twice.
+    """
+    spans: list[tuple[float, float]] = []
+    for index, item in enumerate(raw or []):
+        if isinstance(item, dict):
+            start, end = item.get("start"), item.get("end")
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            start, end = item
+        else:
+            raise ValueError(f"segment {index} must be {{start,end}} or [start,end]")
+        start, end = float(start), float(end)
+        if not (end > start >= 0):
+            raise ValueError(f"segment {index} is not a forward span: {start}-{end}")
+        spans.append((start, end))
+    spans.sort()
+    for (a_start, a_end), (b_start, _b_end) in zip(spans, spans[1:]):
+        if b_start < a_end:
+            raise ValueError(
+                f"segments overlap ({a_start}-{a_end} and {b_start}-...); "
+                "merge them before sending")
+    return spans
+
+
 def _wav_info(path: Path) -> tuple[float, int]:
     """(duration_seconds, sample_rate) for a wav, best-effort but NOT silent:
     a failure raises so a truncated/corrupt render is surfaced."""
@@ -251,6 +282,97 @@ class AceRuntime:
                 return candidate, False
         raise ValueError("embed requires job_id (with a ready wav) or audio_b64")
 
+    def _load_src_audio(self, path: Path) -> Any:
+        """Load a wav as the [channels, samples] 48 kHz tensor repaint wants.
+
+        ACE-Step v1.5 documents src_audio as "[channels, samples] at 48kHz";
+        soundfile hands back [samples, channels], and any clip that was written
+        at a different rate has to be resampled or the repaint window lands on
+        the wrong part of the track.
+        """
+        import numpy as np
+        import soundfile as sf
+        import torch
+
+        data, sr = sf.read(str(path), dtype="float32", always_2d=True)
+        audio = torch.from_numpy(np.ascontiguousarray(data.T))  # -> [channels, samples]
+        if int(sr) != ACE_SAMPLE_RATE:
+            import torchaudio
+
+            audio = torchaudio.functional.resample(audio, int(sr), ACE_SAMPLE_RATE)
+        return audio.contiguous()
+
+    def repaint(self, job: Job) -> None:
+        """Regenerate ONLY the marked spans of an existing track.
+
+        The pipeline repaints one window per call, so N spans are N sequential
+        passes, each fed the previous pass's audio. Spans arrive already merged
+        and sorted (the app's infill_segments owns that), so passes never
+        overlap and the pass count is exactly len(spans).
+        """
+        if self.engine != "v15":
+            raise RuntimeError(
+                "repaint requires --engine v15; the v1 acestep pipeline has no "
+                "repainting_start/repainting_end parameters")
+        import soundfile as sf
+
+        pipe = self._load()
+        p = job.payload or {}
+        spans = _normalize_repaint_spans(p.get("segments"))
+        if not spans:
+            raise ValueError("repaint requires at least one {start,end} segment")
+        src_path, is_temp = self._resolve_audio_path(p)
+        try:
+            audio = self._load_src_audio(src_path)
+        finally:
+            if is_temp:
+                src_path.unlink(missing_ok=True)
+        duration = audio.shape[-1] / float(ACE_SAMPLE_RATE)
+        prompt = str(p.get("prompt") or "")
+        lyrics = str(p.get("lyrics") or "[instrumental]")
+        g = float(p.get("guidance_scale", 7.0))
+        if g > 10.0:
+            g = 7.0
+        steps = max(1, int(p.get("infer_step", 40)))
+        save_path = Path(self.output_dir / f"job_{job.id:06d}.wav")
+        t0 = time.time()
+        for index, (start, end) in enumerate(spans):
+            if start >= duration:
+                raise ValueError(
+                    f"segment {index} starts at {start:.3f}s, past the "
+                    f"{duration:.3f}s track")
+            with self._lock:
+                out = pipe(
+                    prompt=prompt,
+                    lyrics=lyrics,
+                    audio_duration=duration,
+                    num_inference_steps=steps,
+                    guidance_scale=g,
+                    shift=float(p.get("shift", 3.0)),
+                    task_type="repaint",
+                    src_audio=audio,
+                    repainting_start=float(start),
+                    repainting_end=float(min(end, duration)),
+                ).audios
+            audio = out[0].detach().cpu().float()
+            if audio.dim() == 1:
+                audio = audio.unsqueeze(0)
+            print(f"[ace] repaint job {job.id} pass {index + 1}/{len(spans)} "
+                  f"{start:.2f}-{end:.2f}s", flush=True)
+        sf.write(str(save_path), audio.T.numpy(), ACE_SAMPLE_RATE)
+        _to_pcm16(save_path)
+        dur, sr = _wav_info(save_path)
+        rec = AudioRecord(save_path, dur, sr)
+        waveform = save_path.with_name(save_path.stem + ".waveform.png")
+        try:
+            _waveform_png(save_path, waveform)
+            rec.waveform_path = waveform
+        except Exception as exc:  # noqa: BLE001 -- visual is non-fatal
+            print(f"[ace] waveform failed job {job.id}: {exc}", flush=True)
+        job.audios = [rec]
+        print(f"[ace] repaint job {job.id} -> {save_path.name} {len(spans)} pass(es) "
+              f"{time.time() - t0:.1f}s", flush=True)
+
     def _load_embedder(self) -> Any:
         if self._embedder is not None:
             return self._embedder
@@ -460,7 +582,12 @@ class AppState:
             job.status = "running"
             job.started_at = time.time()
             try:
-                self.runtime.generate(job)
+                # One queue, two operations: a payload carrying segments is an
+                # infill of an existing track, everything else is text2music.
+                if (job.payload or {}).get("segments"):
+                    self.runtime.repaint(job)
+                else:
+                    self.runtime.generate(job)
                 job.status = "done"
             except Exception as exc:  # noqa: BLE001
                 job.status = "error"
