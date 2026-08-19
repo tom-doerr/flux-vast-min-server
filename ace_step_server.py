@@ -66,12 +66,27 @@ def _normalize_repaint_spans(raw: Any) -> list[tuple[float, float]]:
 # into either side's content.
 REPAINT_CROSSFADE_S = 0.020
 
-# Extra audio repainted on EACH side of a marked span, used only as crossfade
-# material. Without it the fade joins model audio to source audio cold; with it
-# both sides of the fade are model output that was itself conditioned on the
-# surrounding source, so the join has somewhere to converge. Must exceed the
-# crossfade, or there is no padded material to fade within.
-REPAINT_PAD_S = 0.250
+# Extra audio repainted on EACH side of a marked span, as crossfade material.
+#
+# ★ DEFAULT 0 -- MEASURED WORSE, contrary to the obvious argument for it.
+# The theory was that padding gives the fade model-audio on both sides instead
+# of joining model to source cold. The theory is wrong about what the unpadded
+# fade actually blends: repaint returns the SOURCE ROUND-TRIPPED through the VAE
+# outside its window (measured corr 0.95 against the source), so the unpadded
+# crossfade already blends source against near-source -- the ideal partner.
+# Padding replaces that with newly generated content, which has no reason to
+# match the source's level. Measured on the same track and spans:
+#
+#   seam   no pad              +250ms pad
+#   5.0s   dip -0.2 dB         dip -2.8 dB
+#   8.0s   dip -0.4 dB         dip -3.3 dB
+#  20.0s   dip -0.0 dB         dip +2.0 dB
+#
+# Waveform continuity improved at one seam (step ratio 1.23 -> 0.07) and got
+# worse at another, so there is no continuity win to trade the level loss for.
+# Kept as a per-request knob (repaint_pad_s) because the result may differ for
+# very short spans, where the model has less room to diverge.
+REPAINT_PAD_S = 0.0
 
 
 def _equal_power_ramp(length: int, dtype: Any, device: Any) -> tuple[Any, Any]:
