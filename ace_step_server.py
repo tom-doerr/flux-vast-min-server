@@ -80,6 +80,8 @@ def _equal_power_ramp(length: int, dtype: Any, device: Any) -> tuple[Any, Any]:
     """
     import math
 
+    import torch  # module-level torch is deliberately absent: it is a box-only dep
+
     theta = torch.linspace(0.0, math.pi / 2, length, dtype=dtype, device=device)
     return torch.sin(theta), torch.cos(theta)
 
