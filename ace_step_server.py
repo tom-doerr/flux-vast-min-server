@@ -61,6 +61,52 @@ def _normalize_repaint_spans(raw: Any) -> list[tuple[float, float]]:
     return spans
 
 
+# Equal-power crossfade at each splice boundary. Long enough to hide a phase
+# discontinuity between source and regenerated audio, short enough not to eat
+# into either side's content.
+REPAINT_CROSSFADE_S = 0.020
+
+
+def _splice_repaint(source: Any, repainted: Any, spans: list[tuple[float, float]],
+                    sample_rate: int, crossfade_s: float = REPAINT_CROSSFADE_S) -> Any:
+    """Keep the SOURCE audio outside the marked spans, bit for bit.
+
+    ★ Why this exists: repaint round-trips the WHOLE track through the VAE, so
+    the unmarked audio comes back as the same music at ~0.95 correlation rather
+    than unchanged -- and iterating compounds that (0.95 after one pass, 0.89
+    after two). Since the point of infill is to keep the good parts, the good
+    parts are taken from the source and only the marked spans come from the
+    model, with a short equal-power crossfade so the joins do not click.
+    """
+    import torch
+
+    out = source.clone()
+    total = out.shape[-1]
+    # max(1, ...) would force a one-sample fade even when crossfading is off,
+    # writing one sample PAST the span and breaking exact preservation.
+    fade = max(0, int(round(float(crossfade_s) * int(sample_rate))))
+    for start_s, end_s in spans:
+        start = max(0, min(total, int(round(float(start_s) * sample_rate))))
+        end = max(start, min(total, int(round(float(end_s) * sample_rate))))
+        if end <= start:
+            continue
+        out[..., start:end] = repainted[..., start:end]
+        # Fade the boundaries against the source we just cut into. Guarded so a
+        # span at the very edge of the clip cannot read outside the buffer.
+        head = min(fade, start, end - start)
+        if head > 0:
+            ramp = torch.linspace(0.0, 1.0, head, dtype=out.dtype, device=out.device)
+            lo = start - head
+            out[..., lo:start] = (source[..., lo:start] * (1.0 - ramp)
+                                  + repainted[..., lo:start] * ramp)
+        tail = min(fade, total - end, end - start)
+        if tail > 0:
+            ramp = torch.linspace(1.0, 0.0, tail, dtype=out.dtype, device=out.device)
+            out[..., end:end + tail] = (repainted[..., end:end + tail] * ramp
+                                        + source[..., end:end + tail] * (1.0 - ramp))
+    return out
+
+
 def _wav_info(path: Path) -> tuple[float, int]:
     """(duration_seconds, sample_rate) for a wav, best-effort but NOT silent:
     a failure raises so a truncated/corrupt render is surfaced."""
@@ -354,11 +400,19 @@ class AceRuntime:
                     repainting_start=float(start),
                     repainting_end=float(min(end, duration)),
                 ).audios
-            audio = out[0].detach().cpu().float()
-            if audio.dim() == 1:
-                audio = audio.unsqueeze(0)
+            produced = out[0].detach().cpu().float()
+            if produced.dim() == 1:
+                produced = produced.unsqueeze(0)
+            if produced.shape[-1] != audio.shape[-1]:
+                raise RuntimeError(
+                    f"repaint returned {produced.shape[-1]} samples for a "
+                    f"{audio.shape[-1]}-sample track; cannot splice")
+            # Splice per pass, so the NEXT pass reads source-quality audio
+            # everywhere except the spans already repainted.
+            audio = _splice_repaint(
+                audio, produced, [(start, min(end, duration))], ACE_SAMPLE_RATE)
             print(f"[ace] repaint job {job.id} pass {index + 1}/{len(spans)} "
-                  f"{start:.2f}-{end:.2f}s", flush=True)
+                  f"{start:.2f}-{end:.2f}s spliced", flush=True)
         sf.write(str(save_path), audio.T.numpy(), ACE_SAMPLE_RATE)
         _to_pcm16(save_path)
         dur, sr = _wav_info(save_path)
