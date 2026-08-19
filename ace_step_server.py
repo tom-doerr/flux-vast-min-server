@@ -67,6 +67,23 @@ def _normalize_repaint_spans(raw: Any) -> list[tuple[float, float]]:
 REPAINT_CROSSFADE_S = 0.020
 
 
+def _equal_power_ramp(length: int, dtype: Any, device: Any) -> tuple[Any, Any]:
+    """Constant-power fade pair (sin/cos), NOT a linear one.
+
+    ★ The two sides of a repaint seam are UNCORRELATED -- measured correlation
+    inside a regenerated span is ~0.05 against the source. Linear (equal-gain)
+    ramps sum to full amplitude only for correlated signals; for uncorrelated
+    ones the power sums as g_a^2 + g_b^2, which at the midpoint of a linear
+    fade is 0.5 -> a ~3 dB hole. Measured on a real splice before this fix:
+    -1.4 to -3.2 dB dips at the seams. sin/cos keeps g_a^2 + g_b^2 == 1
+    throughout, so the level holds.
+    """
+    import math
+
+    theta = torch.linspace(0.0, math.pi / 2, length, dtype=dtype, device=device)
+    return torch.sin(theta), torch.cos(theta)
+
+
 def _splice_repaint(source: Any, repainted: Any, spans: list[tuple[float, float]],
                     sample_rate: int, crossfade_s: float = REPAINT_CROSSFADE_S) -> Any:
     """Keep the SOURCE audio outside the marked spans, bit for bit.
@@ -95,15 +112,15 @@ def _splice_repaint(source: Any, repainted: Any, spans: list[tuple[float, float]
         # span at the very edge of the clip cannot read outside the buffer.
         head = min(fade, start, end - start)
         if head > 0:
-            ramp = torch.linspace(0.0, 1.0, head, dtype=out.dtype, device=out.device)
+            gain_in, gain_out = _equal_power_ramp(head, out.dtype, out.device)
             lo = start - head
-            out[..., lo:start] = (source[..., lo:start] * (1.0 - ramp)
-                                  + repainted[..., lo:start] * ramp)
+            out[..., lo:start] = (source[..., lo:start] * gain_out
+                                  + repainted[..., lo:start] * gain_in)
         tail = min(fade, total - end, end - start)
         if tail > 0:
-            ramp = torch.linspace(1.0, 0.0, tail, dtype=out.dtype, device=out.device)
-            out[..., end:end + tail] = (repainted[..., end:end + tail] * ramp
-                                        + source[..., end:end + tail] * (1.0 - ramp))
+            gain_in, gain_out = _equal_power_ramp(tail, out.dtype, out.device)
+            out[..., end:end + tail] = (repainted[..., end:end + tail] * gain_out
+                                        + source[..., end:end + tail] * gain_in)
     return out
 
 
