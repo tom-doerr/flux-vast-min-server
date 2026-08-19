@@ -66,6 +66,13 @@ def _normalize_repaint_spans(raw: Any) -> list[tuple[float, float]]:
 # into either side's content.
 REPAINT_CROSSFADE_S = 0.020
 
+# Extra audio repainted on EACH side of a marked span, used only as crossfade
+# material. Without it the fade joins model audio to source audio cold; with it
+# both sides of the fade are model output that was itself conditioned on the
+# surrounding source, so the join has somewhere to converge. Must exceed the
+# crossfade, or there is no padded material to fade within.
+REPAINT_PAD_S = 0.250
+
 
 def _equal_power_ramp(length: int, dtype: Any, device: Any) -> tuple[Any, Any]:
     """Constant-power fade pair (sin/cos), NOT a linear one.
@@ -401,11 +408,22 @@ class AceRuntime:
         steps = max(1, int(p.get("infer_step", 40)))
         save_path = Path(self.output_dir / f"job_{job.id:06d}.wav")
         t0 = time.time()
+        pad = max(0.0, float(p.get("repaint_pad_s", REPAINT_PAD_S)))
+        if pad and pad <= REPAINT_CROSSFADE_S:
+            raise ValueError(
+                f"repaint_pad_s ({pad}) must exceed the crossfade "
+                f"({REPAINT_CROSSFADE_S}) or there is nothing to fade within")
         for index, (start, end) in enumerate(spans):
             if start >= duration:
                 raise ValueError(
                     f"segment {index} starts at {start:.3f}s, past the "
                     f"{duration:.3f}s track")
+            # Repaint WIDER than asked, then splice at the requested edges: the
+            # crossfade then blends model->model (both conditioned on the same
+            # source) instead of model->source, which is where a cold join
+            # audibly steps.
+            gen_start = max(0.0, start - pad)
+            gen_end = min(duration, end + pad)
             with self._lock:
                 out = pipe(
                     prompt=prompt,
@@ -416,8 +434,8 @@ class AceRuntime:
                     shift=float(p.get("shift", 3.0)),
                     task_type="repaint",
                     src_audio=audio,
-                    repainting_start=float(start),
-                    repainting_end=float(min(end, duration)),
+                    repainting_start=float(gen_start),
+                    repainting_end=float(gen_end),
                 ).audios
             produced = out[0].detach().cpu().float()
             if produced.dim() == 1:
@@ -431,7 +449,8 @@ class AceRuntime:
             audio = _splice_repaint(
                 audio, produced, [(start, min(end, duration))], ACE_SAMPLE_RATE)
             print(f"[ace] repaint job {job.id} pass {index + 1}/{len(spans)} "
-                  f"{start:.2f}-{end:.2f}s spliced", flush=True)
+                  f"{start:.2f}-{end:.2f}s (generated {gen_start:.2f}-"
+                  f"{gen_end:.2f}s, pad {pad:.2f}s) spliced", flush=True)
         sf.write(str(save_path), audio.T.numpy(), ACE_SAMPLE_RATE)
         _to_pcm16(save_path)
         dur, sr = _wav_info(save_path)
