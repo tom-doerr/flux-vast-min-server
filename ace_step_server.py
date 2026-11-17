@@ -17,11 +17,13 @@ import queue
 import threading
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+from render_receipts import OperationConflict, Receipts, file_identity
 
 DEFAULT_MODEL = "ACE-Step/ACE-Step-v1-3.5B"
 # ACE-Step 1.5 (diffusers AceStepPipeline): XL SFT = commercial-grade, stereo
@@ -242,16 +244,42 @@ class Job:
     audios: list[AudioRecord] = field(default_factory=list)
     started_at: float = 0.0
     finished_at: float = 0.0
+    operation_id: str = ""
+    request_sha256: str = ""
+    seed: int | None = None
+    retain_outputs: bool = True
+    renderer_identity: dict[str, Any] = field(default_factory=dict)
+    recipe_sha256: str = ""
+    output_identity: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def restore(cls, record: dict[str, Any]) -> "Job":
+        values = {key: value for key, value in record.items() if key in {f.name for f in fields(cls)}}
+        values["audios"] = [AudioRecord(Path(a["path"]), a["duration"], a["sample_rate"],
+            Path(a["waveform_path"]) if a.get("waveform_path") else None) for a in values.get("audios", [])]
+        return cls(**values)
 
     def payload_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
-            "status": self.status,
+            "operation_id": self.operation_id,
+            "request_sha256": self.request_sha256,
+            "seed": self.seed,
+            "output_identity": self.output_identity,
+            "status": "output_expired" if self.status == "done" and any(not a.path.is_file() for a in self.audios) else self.status,
             "error": self.error,
             "audios": [a.payload(self.id, i) for i, a in enumerate(self.audios)],
             "started_at": self.started_at,
             "finished_at": self.finished_at,
         }
+
+
+def _pipeline_seed(payload: dict[str, Any]) -> dict[str, Any]:
+    # Preserve the original pipeline defaults when no explicit seed was sent.
+    if payload.get("seed") is None:
+        return {}
+    import torch
+    return {"generator": torch.Generator(device="cuda").manual_seed(int(payload["seed"]))}
 
 
 class AceRuntime:
@@ -290,7 +318,13 @@ class AceRuntime:
                 try:
                     cutoff = time.time() - retention_min * 60
                     removed = 0
+                    retained = self.receipts.retained_ids() if getattr(self, "receipts", None) else None
                     for f in self.output_dir.glob("*"):
+                        # Until AppState has opened the journal, do not prune
+                        # any job output. Later, only acknowledged outputs age out.
+                        token = f.stem.split(".", 1)[0].removeprefix("job_")
+                        if f.name.startswith("job_") and (retained is None or (token.isdigit() and int(token) in retained)):
+                            continue
                         try:
                             if f.is_file() and f.stat().st_mtime < cutoff:
                                 f.unlink()
@@ -421,6 +455,7 @@ class AceRuntime:
         if g > 10.0:
             g = 7.0
         steps = max(1, int(p.get("infer_step", 40)))
+        seeded = _pipeline_seed(p)
         save_path = Path(self.output_dir / f"job_{job.id:06d}.wav")
         t0 = time.time()
         pad = max(0.0, float(p.get("repaint_pad_s", REPAINT_PAD_S)))
@@ -447,6 +482,7 @@ class AceRuntime:
                     num_inference_steps=steps,
                     guidance_scale=g,
                     shift=float(p.get("shift", 3.0)),
+                    **seeded,
                     task_type="repaint",
                     src_audio=audio,
                     repainting_start=float(gen_start),
@@ -586,6 +622,7 @@ class AceRuntime:
                     num_inference_steps=max(1, steps),
                     guidance_scale=g,
                     shift=float(p.get("shift", 3.0)),
+                    **_pipeline_seed(p),
                 ).audios
             wav = Path(save_path)
             sf.write(str(wav), audio[0].T.cpu().float().numpy(), pipe.sample_rate)
@@ -601,7 +638,7 @@ class AceRuntime:
                     scheduler_type=str(p.get("scheduler_type", "euler")),
                     cfg_type=str(p.get("cfg_type", "apg")),
                     omega_scale=float(p.get("omega_scale", 10.0)),
-                    manual_seeds=p.get("manual_seeds"),
+                    manual_seeds=p.get("manual_seeds") if p.get("manual_seeds") is not None else (str(int(p["seed"])) if p.get("seed") is not None else None),
                     save_path=save_path,
                     batch_size=1,
                 )
@@ -626,9 +663,19 @@ class AppState:
     def __init__(self, runtime: AceRuntime) -> None:
         self.runtime = runtime
         self._jobs: dict[int, Job] = {}
-        self._counter = 0
+        self.receipts = Receipts(runtime.output_dir / ".render-receipts", exclusive=True)
+        runtime.receipts = self.receipts
         self._lock = threading.Lock()
         self._queue: "queue.Queue[int]" = queue.Queue()
+        for record in self.receipts.all():
+            job = Job.restore(record)
+            self._jobs[job.id] = job
+            if job.status == "running":
+                job.status = "interrupted"
+                job.error = "Renderer interrupted before completed output manifest; retained without resubmission"
+                self.receipts.save(asdict(job))
+            elif job.status == "queued":
+                self._queue.put(job.id)
         self._worker = threading.Thread(target=self._loop, name="ace-worker", daemon=True)
         self._worker.start()
         self.preloading = False
@@ -655,11 +702,26 @@ class AppState:
 
     def enqueue(self, payload: dict[str, Any]) -> Job:
         with self._lock:
-            self._counter += 1
-            job = Job(id=self._counter, payload=payload)
+            if payload.get("operation_id"):
+                previous = self.receipts.find(payload["operation_id"], payload)
+                if previous:
+                    return self._jobs[previous["id"]]
+            seed = int(payload["seed"]) if payload.get("seed") is not None else None
+            if seed is not None and not 0 <= seed < 2**63:
+                raise ValueError("seed must be a nonnegative 63-bit integer")
+            if seed is not None and payload.get("manual_seeds") is not None and str(payload["manual_seeds"]) != str(seed):
+                raise ValueError("manual_seeds conflicts with the frozen seed")
+            frozen = Job(id=0, payload=dict(payload), seed=seed, retain_outputs=bool(payload.get("operation_id")),
+                         renderer_identity=self._identity(),
+                         recipe_sha256=file_identity(__file__)["sha256"])
+            job = Job.restore(self.receipts.create(payload, asdict(frozen)))
             self._jobs[job.id] = job
         self._queue.put(job.id)
         return job
+
+    def _identity(self) -> dict[str, Any]:
+        return {"model": self.runtime._model_id, "engine": self.runtime.engine,
+                "dtype": self.runtime.dtype, "checkpoint_dir": self.runtime.checkpoint_dir}
 
     def get(self, job_id: int) -> Job | None:
         with self._lock:
@@ -678,7 +740,7 @@ class AppState:
             total = len(self._jobs)
         pending = counts.get("queued", 0) + counts.get("running", 0)
         return {"jobs_total": total, "status_counts": counts,
-                "queue_size": pending, "model": self.runtime._model_id}
+                "queue_size": pending, "model": self.runtime._model_id, "operation_protocol": "durable-v1"}
 
     def _loop(self) -> None:
         while True:
@@ -689,12 +751,20 @@ class AppState:
             job.status = "running"
             job.started_at = time.time()
             try:
+                if job.renderer_identity != self._identity() or job.recipe_sha256 != file_identity(__file__)["sha256"]:
+                    raise RuntimeError("Queued operation belongs to a different renderer model or recipe")
+                self.receipts.save(asdict(job))
                 # One queue, two operations: a payload carrying segments is an
                 # infill of an existing track, everything else is text2music.
                 if (job.payload or {}).get("segments"):
                     self.runtime.repaint(job)
                 else:
                     self.runtime.generate(job)
+                if len(job.audios) != 1:
+                    raise RuntimeError("Expected exactly one completed audio output")
+                job.output_identity = {"wav": file_identity(job.audios[0].path)}
+                if job.audios[0].waveform_path:
+                    job.output_identity["waveform"] = file_identity(job.audios[0].waveform_path)
                 job.status = "done"
             except Exception as exc:  # noqa: BLE001
                 job.status = "error"
@@ -703,6 +773,8 @@ class AppState:
                 print(f"[ace] job {job_id} FAILED: {job.error}\n{job.traceback}", flush=True)
             finally:
                 job.finished_at = time.time()
+                self.receipts.save(asdict(job))
+                self._queue.task_done()
 
     def _progress_snapshot(self) -> tuple[int, float, float]:
         """(pending, oldest_running_age_s, since_last_progress_s), now-based.
@@ -798,6 +870,13 @@ class Handler(BaseHTTPRequestHandler):
                                "runtime": rt.engine, "quant": rt.dtype,
                                "model_revision": rt.model_revision(),
                                **self.state.status(), "gpu": gpu_status()})
+        parts = path.strip("/").split("/")
+        if len(parts) == 2 and parts[0] == "operations":
+            try:
+                record = self.state.receipts.find(parts[1])
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 400)
+            return self._json(self.state.get(record["id"]).payload_dict()) if record else self._json({"error": "not found"}, 404)
         if path == "/jobs":
             query = parse_qs(parsed.query)
             limit = max(1, int((query.get("limit") or ["25"])[0]))
@@ -842,9 +921,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "invalid json"}, 400)
         if not isinstance(payload, dict):
             return self._json({"error": "payload must be an object"}, 400)
+        parts = path.strip("/").split("/")
+        if len(parts) == 3 and parts[0] == "operations" and parts[2] == "ack":
+            try:
+                record = self.state.receipts.acknowledge(parts[1], str(payload.get("request_sha256") or ""))
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 409)
+            return self._json({"ok": True, "operation_id": record["operation_id"]})
         if path == "/generate/enqueue":
-            job = self.state.enqueue(payload)
-            return self._json({"id": job.id, "status": job.status})
+            try:
+                job = self.state.enqueue(payload)
+            except OperationConflict as exc:
+                return self._json({"error": str(exc)}, 409)
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 400)
+            return self._json(job.payload_dict())
         if path == "/embed":
             try:
                 return self._json(self.state.runtime.embed(payload))
