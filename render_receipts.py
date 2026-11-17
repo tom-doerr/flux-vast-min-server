@@ -86,7 +86,7 @@ class Receipts:
         job = json.loads(row[3], object_hook=_decode)
         job.update(json.loads(row[4], object_hook=_decode))
         job.update(id=row[0], job_id=row[0], operation_id=row[1], request_sha256=row[2])
-        if job.get("status") in {"done", "error", "cancelled", "interrupted"}:
+        if job.get("status") in {"done", "error", "cancelled", "interrupted", "abandoned"}:
             job["payload"] = {}
         job.setdefault("payload", {})
         return job
@@ -136,7 +136,7 @@ class Receipts:
                                   (_json(state), job["id"], job["operation_id"]))
             if cursor.rowcount != 1:
                 raise RuntimeError("renderer receipt disappeared; refusing untracked work")
-            if job.get("status") in {"done", "error", "cancelled", "interrupted"}:
+            if job.get("status") in {"done", "error", "cancelled", "interrupted", "abandoned"}:
                 conn.execute("UPDATE receipts SET frozen=json_remove(frozen, '$.payload') WHERE id=?", (job["id"],))
 
     def acknowledge(self, identity: str, digest: str) -> dict[str, Any]:
