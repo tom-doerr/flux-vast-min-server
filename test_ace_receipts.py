@@ -151,23 +151,18 @@ class ReceiptTests(unittest.TestCase):
         runtime.output_dir, runtime.engine, runtime._lock = self.root, "v15", threading.Lock()
         captured = []
 
-        class Audio:
-            @property
-            def T(self): return self
-            def cpu(self): return self
-            def float(self): return self
-            def numpy(self): return []
-
         class Pipeline:
             sample_rate = 48000
             def __call__(self, **kwargs):
                 captured.append(kwargs)
-                return SimpleNamespace(audios=[Audio()])
+                return SimpleNamespace(audios="latents")
 
         runtime._load = lambda: Pipeline()
+        # The decode/gain/latents step has its own torch-backed tests (test_ace_continuation.py).
+        runtime._write_text2music = lambda job, wav, latents, decoded: wav.write_bytes(b"wav")
         fake_torch = SimpleNamespace(Generator=lambda **kwargs: SimpleNamespace(manual_seed=lambda seed: ("seed", seed)))
-        fake_soundfile = SimpleNamespace(write=lambda path, *args: Path(path).write_bytes(b"wav"))
-        with patch.dict("sys.modules", {"torch": fake_torch, "soundfile": fake_soundfile}), \
+        with patch.dict("sys.modules", {"torch": fake_torch}), \
+             patch.object(server, "_decode_latents", return_value="decoded"), \
              patch.object(server, "_to_pcm16"), patch.object(server, "_wav_info", return_value=(1, 48000)), \
              patch.object(server, "_waveform_png", side_effect=lambda wav, target: target.write_bytes(b"png")):
             runtime.generate(server.Job(1, {"prompt": "legacy"}))
@@ -175,6 +170,7 @@ class ReceiptTests(unittest.TestCase):
         self.assertNotIn("generator", captured[0])
         self.assertEqual(captured[1]["generator"], ("seed", 0))
         self.assertEqual(captured[1]["num_inference_steps"], captured[0]["num_inference_steps"])
+        self.assertEqual([call["output_type"] for call in captured], ["latent", "latent"])
 
     def test_seed_only_changes_explicitly_seeded_calls(self):
         self.assertEqual(server._pipeline_seed({}), {})

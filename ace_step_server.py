@@ -7,11 +7,19 @@ a wav clip. Loads ACE-Step-v1-3.5B ONCE (lazy, lock-guarded), non-blocking
 preload in a bg thread; a single worker thread drains the queue one job at a
 time (one GPU). No silent fallbacks: a failed render marks the job 'error' with
 the traceback rather than returning a bogus/empty clip.
+
+One queue, three operations: text2music, repaint of marked `segments`, and a
+`continuation` that pins the parent's latents (ace-latent-pin-v1, see
+`AceRuntime.continuation`). v15 text2music and continuation also store their
+final latents (`job_N.latents.npy`, GET /jobs/N/latents).
 """
 from __future__ import annotations
 
 import argparse
+import base64
+import io
 import json
+import math
 import os
 import queue
 import threading
@@ -33,6 +41,24 @@ STATE: "AppState | None" = None
 
 
 ACE_SAMPLE_RATE = 48000
+
+# ACE-Step 1.5 VAE (AutoencoderOobleck, downsampling 2*4*4*6*10): one latent
+# frame = 1920 samples = 40 ms; 64 channels.
+LATENT_HOP = 1920
+LATENT_CHANNELS = 64
+# The pipeline's own output normalization: peak -> -1 dBFS.
+TARGET_PEAK = 10.0 ** (-1.0 / 20.0)
+# Memoryless soft clip on decode * gain: identity up to the knee, so a render
+# normalized to -1 dBFS (0.891) passes through unchanged.
+SOFT_CLIP_KNEE = 0.95
+CONTINUATION_PROTOCOL = "ace-latent-pin-v1"
+LATENTS_FORMAT = "ace-latents-v1"
+CAPABILITIES = (f"continuation:{CONTINUATION_PROTOCOL}", f"latents:{LATENTS_FORMAT}")
+MIN_CONTINUATION_FRAMES = 25  # 1 s of context and of new audio
+# The decoder reaches ~9 frames around each latent: the join crossfade must end
+# this many frames before the first new latent, so it blends only audio that
+# decodes from the parent's context.
+DECODER_REACH_FRAMES = 10
 
 
 def _normalize_repaint_spans(raw: Any) -> list[tuple[float, float]]:
@@ -199,6 +225,361 @@ def _waveform_png(wav_path: Path, out_path: Path, width: int = 900, height: int 
     img.save(str(out_path))
 
 
+def _soft_clip(audio: Any, knee: float = SOFT_CLIP_KNEE) -> Any:
+    """y = x for |x| <= knee, else sign(x) * (k + (1-k) * tanh((|x|-k)/(1-k))).
+
+    float32 and memoryless: re-applying it to the same decode reproduces the
+    same samples, and |y| never exceeds 1 (no PCM16 wrap-around).
+    """
+    import numpy as np
+
+    x = np.asarray(audio, dtype=np.float32)
+    k = np.float32(knee)
+    magnitude = np.abs(x)
+    over = magnitude > k
+    if not over.any():
+        return x
+    span = np.float32(1.0) - k
+    soft = k + span * np.tanh((magnitude - k) / span)
+    return np.where(over, np.sign(x) * soft, x).astype(np.float32)
+
+
+def _gain_envelope(points: list[tuple[int, float]], length: int, cut: int) -> Any:
+    """Per-sample float32 gain: piecewise linear between [sample, gain]
+    breakpoints (constant outside them) before `cut`, the gain at `cut` after."""
+    import numpy as np
+
+    xs = np.array([p[0] for p in points], dtype=np.float64)
+    gains = np.array([p[1] for p in points], dtype=np.float64)
+    t = np.minimum(np.arange(length, dtype=np.float64), float(cut))
+    return np.interp(t, xs, gains).astype(np.float32)
+
+
+def _shift_envelope(points: list[tuple[int, float]], start: int, cut: int) -> list[list[float]]:
+    """The same envelope in the coordinates of audio that begins at `start`:
+    breakpoints inside (start, cut) move by -start, both ends are interpolated,
+    and the gain at `cut` holds after it. A constant one comes back as [[0, g]]."""
+    import numpy as np
+
+    xs = [p[0] for p in points]
+    gains = [p[1] for p in points]
+    shifted = ([[0, float(np.interp(start, xs, gains))]]
+               + [[s - start, g] for s, g in points if start < s < cut]
+               + [[cut - start, float(np.interp(cut, xs, gains))]])
+    while len(shifted) > 1 and shifted[-1][1] == shifted[-2][1]:
+        shifted.pop()
+    return shifted
+
+
+def _pcm16(audio: Any) -> Any:
+    """float [samples, channels] -> int16 exactly as sf.write(..., "PCM_16")
+    converts it, so continuation audio quantizes like every stored render."""
+    import numpy as np
+    import soundfile as sf
+
+    buffer = io.BytesIO()
+    sf.write(buffer, np.asarray(audio, dtype=np.float32), ACE_SAMPLE_RATE, format="WAV", subtype="PCM_16")
+    buffer.seek(0)
+    data, _sr = sf.read(buffer, dtype="int16", always_2d=True)
+    return data
+
+
+def _splice_continuation(scaffold: Any, rendered: Any, join_frame: int,
+                         crossfade_frames: int, hop: int = LATENT_HOP) -> Any:
+    """[0, join_frame*hop) = scaffold bit for bit; then a LINEAR crossfade to
+    the render over crossfade_frames (weight i/n: its first sample is the
+    scaffold's); then the render. int16 [samples, channels] in and out.
+
+    Linear, not equal-power: both sides decode the same parent audio (corr
+    ~1), and for correlated signals equal-gain weights keep the level.
+    """
+    import numpy as np
+
+    if scaffold.shape != rendered.shape or scaffold.dtype != np.int16 or rendered.dtype != np.int16:
+        raise ValueError(f"splice needs two equal int16 arrays, got {scaffold.dtype}{list(scaffold.shape)} "
+                         f"and {rendered.dtype}{list(rendered.shape)}")
+    start = join_frame * hop
+    end = start + crossfade_frames * hop
+    if join_frame < 0 or crossfade_frames < 1 or end > scaffold.shape[0]:
+        raise ValueError(f"crossfade [{start}, {end}) does not fit {scaffold.shape[0]} samples")
+    out = rendered.copy()
+    out[:start] = scaffold[:start]
+    weight = (np.arange(end - start, dtype=np.float64) / (end - start))[:, None]
+    source = scaffold[start:end].astype(np.float64)
+    out[start:end] = np.rint(source + weight * (rendered[start:end].astype(np.float64) - source)).astype(np.int16)
+    return out
+
+
+def _write_latents(path: Path, latents: Any) -> None:
+    """[frames, 64] latents -> float32 .npy (bf16 -> fp32 is exact); frame k
+    covers the stored audio's samples [k*1920, (k+1)*1920)."""
+    import numpy as np
+
+    array = latents.detach().float().cpu().numpy()
+    if array.ndim != 2 or array.shape[1] != LATENT_CHANNELS:
+        raise RuntimeError(f"latents must be [frames, {LATENT_CHANNELS}], got {list(array.shape)}")
+    np.save(path, np.ascontiguousarray(array, dtype=np.float32), allow_pickle=False)
+
+
+def _whole(spec: dict[str, Any], key: str) -> int:
+    value = spec.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"continuation.{key} must be an integer, got {value!r}")
+    return value
+
+
+def _envelope_points(raw: Any) -> list[tuple[int, float]]:
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("continuation.context_gain must be a non-empty list of [sample, gain]")
+    points: list[tuple[int, float]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError(f"context_gain[{index}] must be [sample, gain], got {item!r}")
+        sample, gain = item
+        if isinstance(sample, bool) or not isinstance(sample, int):
+            raise ValueError(f"context_gain[{index}] sample must be an integer, got {sample!r}")
+        if isinstance(gain, bool) or not isinstance(gain, (int, float)) or not math.isfinite(gain) or gain <= 0:
+            raise ValueError(f"context_gain[{index}] gain must be a positive finite number, got {gain!r}")
+        if points and sample <= points[-1][0]:
+            raise ValueError(f"context_gain samples must increase strictly (index {index})")
+        points.append((sample, float(gain)))
+    return points
+
+
+def _read_scaffold(audio_b64: Any, samples: int) -> Any:
+    """The PCM16 48 kHz context + silence WAV -> int16 [samples, 2]."""
+    import numpy as np
+    import soundfile as sf
+
+    if not audio_b64:
+        raise ValueError("continuation requires audio_b64 (parent context + digital silence)")
+    try:
+        with sf.SoundFile(io.BytesIO(base64.b64decode(audio_b64, validate=True))) as wav:
+            rate, channels, frames, subtype = wav.samplerate, wav.channels, wav.frames, wav.subtype
+            data = wav.read(dtype="int16", always_2d=True)
+    except sf.LibsndfileError as exc:
+        raise ValueError(f"scaffold is not a readable WAV: {exc}") from exc
+    if rate != ACE_SAMPLE_RATE or subtype != "PCM_16":
+        raise ValueError(f"scaffold must be {ACE_SAMPLE_RATE} Hz PCM_16, got {rate} Hz {subtype}")
+    if channels not in (1, 2):
+        raise ValueError(f"scaffold has {channels} channels; only mono or stereo")
+    if frames != samples or data.shape[0] != samples:
+        raise ValueError(f"scaffold has {data.shape[0]} of {frames} frames; the request needs exactly "
+                         f"(context_frames + generate_frames) * {LATENT_HOP} = {samples}")
+    return np.repeat(data, 2, axis=1) if channels == 1 else data
+
+
+def _read_context_latents(latents_b64: Any, frames: int) -> Any:
+    import numpy as np
+
+    try:
+        array = np.load(io.BytesIO(base64.b64decode(latents_b64, validate=True)), allow_pickle=False)
+    except (ValueError, OSError, EOFError) as exc:
+        raise ValueError(f"context_latents_b64 is not a readable .npy: {exc}") from exc
+    if array.dtype != np.float32 or array.shape != (frames, LATENT_CHANNELS):
+        raise ValueError(f"context latents must be float32 [{frames}, {LATENT_CHANNELS}], "
+                         f"got {array.dtype} {list(array.shape)}")
+    if not np.isfinite(array).all():
+        raise ValueError("context latents contain non-finite values")
+    return array
+
+
+@dataclass
+class ContinuationRequest:
+    context_frames: int
+    generate_frames: int
+    join_frame: int
+    crossfade_frames: int
+    context_gain: list[tuple[int, float]]
+    scaffold: Any        # int16 [(C+G)*1920, 2]
+    latents: Any = None  # float32 [C, 64], or None: encode the scaffold's context
+
+
+def _continuation_request(payload: dict[str, Any], *, model: str, revision: str) -> ContinuationRequest:
+    """Validate an ace-latent-pin-v1 request completely; never guess a value."""
+    spec = payload.get("continuation")
+    if not isinstance(spec, dict):
+        raise ValueError("continuation must be an object")
+    if spec.get("protocol") != CONTINUATION_PROTOCOL:
+        raise ValueError(f"continuation protocol {spec.get('protocol')!r} is not {CONTINUATION_PROTOCOL!r}")
+    context, generate, join, crossfade, hop = (_whole(spec, key) for key in (
+        "context_frames", "generate_frames", "join_frame", "crossfade_frames", "latent_hop"))
+    if hop != LATENT_HOP:
+        raise ValueError(f"latent_hop {hop} is not this VAE's {LATENT_HOP}")
+    if context < MIN_CONTINUATION_FRAMES or generate < MIN_CONTINUATION_FRAMES:
+        raise ValueError(f"context_frames ({context}) and generate_frames ({generate}) must both be "
+                         f">= {MIN_CONTINUATION_FRAMES} (1 s)")
+    if crossfade < 1:
+        raise ValueError(f"crossfade_frames must be >= 1, got {crossfade}")
+    if join < 0 or join + crossfade > context - DECODER_REACH_FRAMES:
+        raise ValueError(f"join_frame ({join}) + crossfade_frames ({crossfade}) must be <= context_frames "
+                         f"({context}) - {DECODER_REACH_FRAMES}: the crossfade must stay out of the "
+                         "decoder's reach of the new latents")
+    duration = (context + generate) * LATENT_HOP / ACE_SAMPLE_RATE
+    if payload.get("audio_duration") is not None and abs(float(payload["audio_duration"]) - duration) > 1e-6:
+        raise ValueError(f"audio_duration {payload['audio_duration']} is not (C+G)*{LATENT_HOP}/"
+                         f"{ACE_SAMPLE_RATE} = {duration}")
+    gain_raw = spec.get("context_gain")
+    source_model, source_revision = spec.get("latents_model"), spec.get("latents_model_revision")
+    latents = None
+    if payload.get("context_latents_b64") is not None:
+        if gain_raw is None or not source_model or not source_revision:
+            raise ValueError("context latents need continuation.context_gain, latents_model and "
+                             "latents_model_revision")
+        if (source_model, source_revision) != (model, revision):
+            raise ValueError(f"context latents come from {source_model}@{source_revision}; this renderer "
+                             f"runs {model}@{revision}")
+        gain = _envelope_points(gain_raw)
+        latents = _read_context_latents(payload["context_latents_b64"], context)
+    elif gain_raw is not None or source_model or source_revision:
+        raise ValueError("context_gain, latents_model and latents_model_revision belong to a request "
+                         "that sends context_latents_b64")
+    else:
+        gain = [(0, 1.0)]  # re-encoded from the stored audio, which is already at its stored level
+    scaffold = _read_scaffold(payload.get("audio_b64"), (context + generate) * LATENT_HOP)
+    if scaffold[context * LATENT_HOP:].any():
+        raise ValueError("scaffold must be digital silence after the context frames")
+    return ContinuationRequest(context, generate, join, crossfade, gain, scaffold, latents)
+
+
+def _operation(payload: dict[str, Any]) -> str:
+    """repaint (segments), continuation, or generate (text2music)."""
+    if "continuation" in payload:
+        if "segments" in payload:
+            raise ValueError("a request carries segments (repaint) or continuation, never both")
+        return "continuation"
+    return "repaint" if payload.get("segments") else "generate"
+
+
+def _decode_latents(pipe: Any, latents: Any) -> Any:
+    """[1, T, 64] latents -> float32 [T*1920, 2] audio in one untiled VAE pass.
+
+    Untiled matters: a tiled decode depends on where the tiles fall, so a
+    continuation's decode of its parent's latents would not match the parent.
+    """
+    import numpy as np
+    import torch
+
+    if pipe.sample_rate != ACE_SAMPLE_RATE or pipe.latents_per_second * LATENT_HOP != ACE_SAMPLE_RATE:
+        raise RuntimeError(f"pipeline geometry {pipe.sample_rate} Hz / {pipe.latents_per_second} latents/s "
+                           f"is not {ACE_SAMPLE_RATE} Hz / hop {LATENT_HOP}")
+    if getattr(pipe.vae, "use_tiling", False):
+        raise RuntimeError("VAE tiling is on; latents/continuation need one untiled decode")
+    if latents.dim() != 3 or latents.shape[0] != 1 or latents.shape[2] != LATENT_CHANNELS:
+        raise RuntimeError(f"expected latents [1, T, {LATENT_CHANNELS}], got {list(latents.shape)}")
+    with torch.inference_mode():
+        audio = pipe.vae.decode(latents.transpose(1, 2)).sample.float()
+    expected = [1, 2, latents.shape[1] * LATENT_HOP]
+    if list(audio.shape) != expected:
+        raise RuntimeError(f"VAE decode returned {list(audio.shape)}, expected {expected}")
+    decoded = np.ascontiguousarray(audio[0].cpu().numpy().T)
+    if not np.isfinite(decoded).all():
+        raise RuntimeError("VAE decode produced non-finite samples")
+    return decoded
+
+
+def _pin_schedule(pipe: Any, steps: int, shift: float, device: Any) -> tuple[list[float], list[float]]:
+    """(t at each step, t the latents sit at after it): the pipeline's own
+    schedule; after the final step t_next = 0 (the scheduler's terminal sigma)."""
+    import torch
+
+    schedule = pipe._get_timestep_schedule(num_inference_steps=steps, shift=shift, device=device,
+                                           dtype=torch.float32).tolist()
+    if len(schedule) != steps:
+        raise RuntimeError(f"timestep schedule has {len(schedule)} entries for {steps} steps")
+    return schedule, schedule[1:] + [0.0]
+
+
+def _pinned_denoise(pipe: Any, *, context: Any, noise: Any, context_frames: int, generate_frames: int,
+                    steps: int, shift: float, **call_kwargs: Any) -> Any:
+    """ACE-Step repaint of frames [C, C+G) whose context frames follow the parent.
+
+    After every Euler step the context frames are overwritten with the
+    parent's latents noised to the step's new time, x_t = (1-t)*x0 + t*noise
+    (rectified flow; the same noise as the initial latents), so at t=0 they ARE
+    the parent's latents and the model continues the real parent rather than
+    its own copy of it. For the call, an instance-level prepare_src_latents
+    hands back the given context latents as the repaint conditioning instead
+    of VAE-sampling src_audio. Returns the final [1, C+G, 64] latents.
+    """
+    import torch
+
+    total = context_frames + generate_frames
+    if list(noise.shape) != [1, total, LATENT_CHANNELS]:
+        raise RuntimeError(f"noise must be [1, {total}, {LATENT_CHANNELS}], got {list(noise.shape)}")
+    if list(context.shape) != [1, context_frames, LATENT_CHANNELS]:
+        raise RuntimeError(f"context must be [1, {context_frames}, {LATENT_CHANNELS}], got {list(context.shape)}")
+    # +0.25 frame keeps int(seconds * 25) on the intended frame despite float rounding.
+    start, end = (context_frames + 0.25) / 25, (total + 0.25) / 25
+    lps = pipe.latents_per_second
+    if int(start * lps) != context_frames or int(end * lps) != total:
+        raise RuntimeError(f"repaint window {start}-{end}s maps to frames {int(start * lps)}-{int(end * lps)}, "
+                           f"not {context_frames}-{total}")
+    schedule, t_next = _pin_schedule(pipe, steps, shift, noise.device)
+    context32 = context.to(device=noise.device, dtype=torch.float32)
+    noise32 = noise[:, :context_frames].float()
+    src_full = torch.cat([context32, torch.zeros(1, generate_frames, LATENT_CHANNELS, device=noise.device)], dim=1)
+    pinned_steps: list[int] = []
+
+    def prepare_src_latents(*args: Any, **kwargs: Any) -> Any:
+        if args:
+            raise TypeError("prepare_src_latents called positionally; the pin wrapper only knows keywords")
+        if kwargs.get("src_audio") is None:
+            return original(**kwargs)  # the silence latent the pipeline tiles over the window
+        batch = int(kwargs.get("batch_size") or 1)
+        return src_full.to(device=kwargs["device"], dtype=kwargs["dtype"]).expand(batch, -1, -1), total
+
+    def pin(_pipe: Any, step: int, timestep: Any, tensors: dict[str, Any]) -> dict[str, Any]:
+        if abs(float(timestep) - schedule[step]) > 1e-6:
+            raise RuntimeError(f"pipeline step {step} ran at t={float(timestep)}; the pin schedule says {schedule[step]}")
+        latents = tensors["latents"]
+        t = t_next[step]
+        latents[:, :context_frames] = ((1.0 - t) * context32 + t * noise32).to(latents.dtype)
+        pinned_steps.append(step)
+        return {"latents": latents}
+
+    own = "prepare_src_latents" in vars(pipe)
+    original = pipe.prepare_src_latents
+    pipe.prepare_src_latents = prepare_src_latents
+    try:
+        final = pipe(**call_kwargs, num_inference_steps=steps, shift=shift, task_type="repaint",
+                     repainting_start=start, repainting_end=end, latents=noise, output_type="latent",
+                     callback_on_step_end=pin, callback_on_step_end_tensor_inputs=["latents"]).audios
+    finally:
+        if own:
+            pipe.prepare_src_latents = original
+        else:
+            del pipe.prepare_src_latents
+    if pinned_steps != list(range(steps)):
+        raise RuntimeError(f"the pin ran after steps {pinned_steps}, expected 0..{steps - 1}")
+    if list(final.shape) != [1, total, LATENT_CHANNELS]:
+        raise RuntimeError(f"pipeline returned latents {list(final.shape)}, expected [1, {total}, {LATENT_CHANNELS}]")
+    if not torch.equal(final[:, :context_frames], context32.to(final.dtype)):
+        raise RuntimeError("final context latents differ from the pinned parent latents")
+    return final
+
+
+def _continuation_diagnostics(source: str, request: ContinuationRequest, rendered: Any,
+                              unclipped: Any) -> dict[str, Any]:
+    """Join frame: scaffold vs the (soft-clipped) render there. new_peak_before_clip
+    covers the new frames [C, C+G); soft_clipped_samples counts channel samples
+    over the child's span [J*1920, end) that the clip changed."""
+    import numpy as np
+
+    start = request.join_frame * LATENT_HOP
+    end = start + request.crossfade_frames * LATENT_HOP
+    scaffold = request.scaffold[start:end].astype(np.float64) / 32768.0
+    render = rendered[start:end].astype(np.float64)
+    correlation = None  # undefined when either side is constant (e.g. digital silence)
+    if scaffold.std() > 0 and render.std() > 0:
+        correlation = float(np.corrcoef(scaffold.ravel(), render.ravel())[0, 1])
+    knee = np.float32(SOFT_CLIP_KNEE)
+    return {"context_source": source, "join_sample": start, "crossfade_samples": end - start,
+            "join_max_abs_diff": float(np.abs(scaffold - render).max()), "join_correlation": correlation,
+            "new_peak_before_clip": float(np.abs(unclipped[request.context_frames * LATENT_HOP:]).max()),
+            "soft_clipped_samples": int((np.abs(unclipped[start:]) > knee).sum())}
+
+
 def gpu_status() -> dict[str, Any]:
     try:
         import subprocess
@@ -251,6 +632,9 @@ class Job:
     renderer_identity: dict[str, Any] = field(default_factory=dict)
     recipe_sha256: str = ""
     output_identity: dict[str, Any] = field(default_factory=dict)
+    latents: dict[str, Any] = field(default_factory=dict)       # ace-latents-v1 metadata
+    latents_path: str = ""
+    continuation: dict[str, Any] = field(default_factory=dict)  # seam diagnostics
 
     @classmethod
     def restore(cls, record: dict[str, Any]) -> "Job":
@@ -260,18 +644,25 @@ class Job:
         return cls(**values)
 
     def payload_dict(self) -> dict[str, Any]:
-        return {
+        expired = (any(not a.path.is_file() for a in self.audios)
+                   or bool(self.latents_path and not Path(self.latents_path).is_file()))
+        data = {
             "id": self.id,
             "operation_id": self.operation_id,
             "request_sha256": self.request_sha256,
             "seed": self.seed,
             "output_identity": self.output_identity,
-            "status": "output_expired" if self.status == "done" and any(not a.path.is_file() for a in self.audios) else self.status,
+            "status": "output_expired" if self.status == "done" and expired else self.status,
             "error": self.error,
             "audios": [a.payload(self.id, i) for i, a in enumerate(self.audios)],
             "started_at": self.started_at,
             "finished_at": self.finished_at,
         }
+        if self.latents:
+            data["latents"] = self.latents
+        if self.continuation:
+            data["continuation"] = self.continuation
+        return data
 
 
 def _pipeline_seed(payload: dict[str, Any]) -> dict[str, Any]:
@@ -361,6 +752,30 @@ class AceRuntime:
             rev = ""
         self._model_revision_cache = rev
         return rev
+
+    def _latents_revision(self) -> str:
+        """Latents are only reusable by the exact model that made them."""
+        revision = self.model_revision()
+        if not revision:
+            raise RuntimeError(f"no HF snapshot revision found for {self._model_id}; "
+                               "latents cannot be labelled with their model")
+        return revision
+
+    def _store_latents(self, job: Job, latents: Any, *, gain_envelope: list[list[float]],
+                       render_start_frame: int) -> None:
+        """Write job_N.latents.npy (pruned with the job's other files) and its
+        ace-latents-v1 metadata: decode(latents) * gain_envelope, soft-clipped
+        at the knee, is the stored audio (sample 0 = latent frame 0)."""
+        revision = self._latents_revision()
+        path = self.output_dir / f"job_{job.id:06d}.latents.npy"
+        _write_latents(path, latents)
+        job.latents_path = str(path)
+        job.latents = {"format": LATENTS_FORMAT, "url": f"/jobs/{job.id}/latents",
+                       "frames": int(latents.shape[0]), "latent_hop": LATENT_HOP,
+                       "sample_rate": ACE_SAMPLE_RATE, "channels": LATENT_CHANNELS,
+                       "gain_envelope": gain_envelope, "soft_clip_knee": SOFT_CLIP_KNEE,
+                       "model": self._model_id, "model_revision": revision,
+                       "render_start_frame": render_start_frame}
 
     def _load(self) -> Any:
         with self._lock:
@@ -606,7 +1021,6 @@ class AceRuntime:
         save_path = str(self.output_dir / f"job_{job.id:06d}.wav")
         t0 = time.time()
         if self.engine == "v15":
-            import soundfile as sf
             # v1.5 defaults: SFT wants ~30-60 steps, guidance 7 (APG), shift 3.
             # A v1-era guidance (>10) from an un-updated client is reset, since
             # 15 wrecks v1.5 output. Output is stereo 48kHz float.
@@ -615,17 +1029,21 @@ class AceRuntime:
                 g = 7.0
             steps = int(p.get("infer_step", 40))
             with self._lock:
-                audio = pipe(
+                # Latents out, decoded here: they are kept for continuations,
+                # together with the exact gain that turned them into the WAV.
+                latents = pipe(
                     prompt=prompt,
                     lyrics=lyrics,
                     audio_duration=float(p.get("audio_duration", 30.0)),
                     num_inference_steps=max(1, steps),
                     guidance_scale=g,
                     shift=float(p.get("shift", 3.0)),
+                    output_type="latent",
                     **_pipeline_seed(p),
                 ).audios
+                decoded = _decode_latents(pipe, latents)
             wav = Path(save_path)
-            sf.write(str(wav), audio[0].T.cpu().float().numpy(), pipe.sample_rate)
+            self._write_text2music(job, wav, latents, decoded)
         else:
             with self._lock:
                 out = pipe(
@@ -656,6 +1074,94 @@ class AceRuntime:
             print(f"[ace] waveform failed job {job.id}: {exc}", flush=True)
         job.audios = [rec]
         print(f"[ace] job {job.id} -> {wav.name} {dur:.1f}s @ {sr}Hz "
+              f"{time.time() - t0:.1f}s", flush=True)
+
+    def _write_text2music(self, job: Job, wav: Path, latents: Any, decoded: Any) -> None:
+        """The pipeline's own output level (its two normalization stages are one
+        gain, TARGET_PEAK / peak), written as PCM16 next to the latents."""
+        import numpy as np
+        import soundfile as sf
+
+        gain = TARGET_PEAK / max(float(np.abs(decoded).max()), 1e-6)
+        sf.write(str(wav), _soft_clip(decoded * np.float32(gain)), ACE_SAMPLE_RATE, subtype="PCM_16")
+        self._store_latents(job, latents[0], gain_envelope=[[0, gain]], render_start_frame=0)
+
+    def continuation(self, job: Job) -> None:
+        """Continue a track from its real audio (ace-latent-pin-v1).
+
+        The scaffold is the parent's last C latent frames of audio plus G frames
+        of digital silence. Its C context frames stay pinned to the parent's
+        latents (sent with the request, else the posterior mean of the
+        scaffold's context) while the model writes the G new frames, so the
+        decode continues the parent itself. Output, (C+G)*1920 samples:
+        [0, J*1920) = the scaffold bit for bit, frame J a linear crossfade to
+        the decode, then soft_clip(decode * context gain). The child's latents
+        are frames [J, C+G); the app stores the child from sample J*1920.
+        """
+        if self.engine != "v15":
+            raise RuntimeError("continuation requires --engine v15 (the diffusers AceStepPipeline)")
+        import numpy as np
+        import soundfile as sf
+        import torch
+
+        p = job.payload or {}
+        request = _continuation_request(p, model=self._model_id, revision=self._latents_revision())
+        context, generate = request.context_frames, request.generate_frames
+        total = context + generate
+        g = float(p.get("guidance_scale", 7.0))
+        if g > 10.0:
+            g = 7.0
+        pipe = self._load()
+        scaffold = torch.from_numpy(np.ascontiguousarray(request.scaffold.T, dtype=np.float32) / 32768.0)
+        save_path = self.output_dir / f"job_{job.id:06d}.wav"
+        t0 = time.time()
+        with self._lock:
+            device = pipe._execution_device
+            if request.latents is not None:
+                context_latents = torch.from_numpy(request.latents).unsqueeze(0).to(device)
+            else:
+                with torch.no_grad():  # posterior MEAN; the pipeline itself would sample()
+                    encoded = pipe.vae.encode(scaffold[:, :context * LATENT_HOP].unsqueeze(0).to(
+                        device=device, dtype=pipe.vae.dtype)).latent_dist.mode()
+                if list(encoded.shape) != [1, LATENT_CHANNELS, context]:
+                    raise RuntimeError(f"VAE encode returned {list(encoded.shape)}, "
+                                       f"expected [1, {LATENT_CHANNELS}, {context}]")
+                context_latents = encoded.transpose(1, 2).float()
+            # torch.randn with one generator on the pipeline's device = diffusers' randn_tensor
+            generator = (torch.Generator(device=device).manual_seed(int(p["seed"]))
+                         if p.get("seed") is not None else None)
+            noise = torch.randn((1, total, LATENT_CHANNELS), generator=generator, device=device,
+                                dtype=pipe.transformer.dtype)
+            final = _pinned_denoise(
+                pipe, context=context_latents, noise=noise, context_frames=context, generate_frames=generate,
+                steps=max(1, int(p.get("infer_step", 40))), shift=float(p.get("shift", 3.0)),
+                prompt=str(p.get("prompt") or ""), lyrics=str(p.get("lyrics") or "[instrumental]"),
+                audio_duration=total * LATENT_HOP / ACE_SAMPLE_RATE, guidance_scale=g, src_audio=scaffold)
+            decoded = _decode_latents(pipe, final)
+        cut = context * LATENT_HOP
+        unclipped = decoded * _gain_envelope(request.context_gain, total * LATENT_HOP, cut)[:, None]
+        if not np.isfinite(unclipped).all():
+            raise ValueError("decode * context_gain overflows float32")
+        rendered = _soft_clip(unclipped)
+        out = _splice_continuation(request.scaffold, _pcm16(rendered), request.join_frame, request.crossfade_frames)
+        sf.write(str(save_path), out, ACE_SAMPLE_RATE, subtype="PCM_16")
+        join = request.join_frame * LATENT_HOP
+        self._store_latents(job, final[0, request.join_frame:],
+                            gain_envelope=_shift_envelope(request.context_gain, join, cut),
+                            render_start_frame=request.join_frame)
+        source = "latents" if request.latents is not None else "audio"
+        job.continuation = _continuation_diagnostics(source, request, rendered, unclipped)
+        dur, sr = _wav_info(save_path)
+        rec = AudioRecord(save_path, dur, sr)
+        waveform = save_path.with_name(save_path.stem + ".waveform.png")
+        try:
+            _waveform_png(save_path, waveform)
+            rec.waveform_path = waveform
+        except Exception as exc:  # noqa: BLE001 -- visual is non-fatal
+            print(f"[ace] waveform failed job {job.id}: {exc}", flush=True)
+        job.audios = [rec]
+        print(f"[ace] continuation job {job.id} -> {save_path.name} C={context} G={generate} "
+              f"J={request.join_frame} context={source} join_corr={job.continuation['join_correlation']} "
               f"{time.time() - t0:.1f}s", flush=True)
 
 
@@ -706,6 +1212,7 @@ class AppState:
                 previous = self.receipts.find(payload["operation_id"], payload)
                 if previous:
                     return self._jobs[previous["id"]]
+            _operation(payload)  # segments + continuation together is refused here
             seed = int(payload["seed"]) if payload.get("seed") is not None else None
             if seed is not None and not 0 <= seed < 2**63:
                 raise ValueError("seed must be a nonnegative 63-bit integer")
@@ -754,10 +1261,13 @@ class AppState:
                 if job.renderer_identity != self._identity() or job.recipe_sha256 != file_identity(__file__)["sha256"]:
                     raise RuntimeError("Queued operation belongs to a different renderer model or recipe")
                 self.receipts.save(asdict(job))
-                # One queue, two operations: a payload carrying segments is an
-                # infill of an existing track, everything else is text2music.
-                if (job.payload or {}).get("segments"):
+                # One queue, three operations: segments = infill of an existing
+                # track, continuation = extend one, everything else = text2music.
+                operation = _operation(job.payload or {})
+                if operation == "repaint":
                     self.runtime.repaint(job)
+                elif operation == "continuation":
+                    self.runtime.continuation(job)
                 else:
                     self.runtime.generate(job)
                 if len(job.audios) != 1:
@@ -765,6 +1275,8 @@ class AppState:
                 job.output_identity = {"wav": file_identity(job.audios[0].path)}
                 if job.audios[0].waveform_path:
                     job.output_identity["waveform"] = file_identity(job.audios[0].waveform_path)
+                if job.latents_path:
+                    job.output_identity["latents"] = file_identity(job.latents_path)
                 job.status = "done"
             except Exception as exc:  # noqa: BLE001
                 job.status = "error"
@@ -869,6 +1381,9 @@ class Handler(BaseHTTPRequestHandler):
                                "model": rt._model_id, "embed_model": rt._embed_model_id,
                                "runtime": rt.engine, "quant": rt.dtype,
                                "model_revision": rt.model_revision(),
+                               # A client must see these before it sends a continuation:
+                               # an older server would render that payload as text2music.
+                               "capabilities": list(CAPABILITIES) if rt.engine == "v15" else [],
                                **self.state.status(), "gpu": gpu_status()})
         parts = path.strip("/").split("/")
         if len(parts) == 2 and parts[0] == "operations":
@@ -896,6 +1411,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "not found"}, 404)
         if len(parts) == 2:
             return self._json(job.payload_dict())
+        if len(parts) == 3 and parts[2] == "latents":
+            if not job.latents_path or not Path(job.latents_path).is_file():
+                return self._json({"error": "latents not available"}, 404)
+            return self._bytes(Path(job.latents_path).read_bytes(), "application/octet-stream")
         if len(parts) >= 4 and parts[2] == "audio":
             try:
                 idx = int(parts[3])
