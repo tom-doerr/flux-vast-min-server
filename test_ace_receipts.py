@@ -149,6 +149,7 @@ class ReceiptTests(unittest.TestCase):
     def test_generate_passes_generator_only_for_explicit_seeds(self):
         runtime = server.AceRuntime.__new__(server.AceRuntime)
         runtime.output_dir, runtime.engine, runtime._lock = self.root, "v15", threading.Lock()
+        runtime._model_id, runtime._model_revision_cache = "synthetic", "0123456789abcdef"
         captured = []
 
         class Pipeline:
@@ -159,7 +160,7 @@ class ReceiptTests(unittest.TestCase):
 
         runtime._load = lambda: Pipeline()
         # The decode/gain/latents step has its own torch-backed tests (test_ace_continuation.py).
-        runtime._write_text2music = lambda job, wav, latents, decoded: wav.write_bytes(b"wav")
+        runtime._write_text2music = lambda job, wav, latents, decoded, revision: wav.write_bytes(b"wav")
         fake_torch = SimpleNamespace(Generator=lambda **kwargs: SimpleNamespace(manual_seed=lambda seed: ("seed", seed)))
         with patch.dict("sys.modules", {"torch": fake_torch}), \
              patch.object(server, "_decode_latents", return_value="decoded"), \

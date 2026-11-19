@@ -778,12 +778,12 @@ class AceRuntime:
                                    f"{exc}); latents cannot be labelled with their model") from exc
         return self._model_revision_cache
 
-    def _store_latents(self, job: Job, latents: Any, *, gain_envelope: list[list[float]],
+    def _store_latents(self, job: Job, latents: Any, *, revision: str, gain_envelope: list[list[float]],
                        render_start_frame: int) -> None:
         """Write job_N.latents.npy (pruned with the job's other files) and its
         ace-latents-v1 metadata: decode(latents) * gain_envelope, soft-clipped
-        at the knee, is the stored audio (sample 0 = latent frame 0)."""
-        revision = self._latents_revision()
+        at the knee, is the stored audio (sample 0 = latent frame 0). revision =
+        the caller's _latents_revision(), resolved before its render."""
         path = self.output_dir / f"job_{job.id:06d}.latents.npy"
         _write_latents(path, latents)
         job.latents_path = str(path)
@@ -807,8 +807,8 @@ class AceRuntime:
                 # Every v15 render labels its latents with the revision: look it up now
                 # that the load has its snapshot, so the label names what was loaded and
                 # a missing one fails the preload here, not each later job. The pipeline
-                # stays loaded: repaint needs no revision, and each job that labels
-                # latents looks again.
+                # stays loaded: repaint needs no revision, and generate/continuation
+                # look again before they render.
                 self._model_revision_cache = ""
                 print(f"model revision {self._latents_revision()}", flush=True)
                 return self._pipe
@@ -1045,6 +1045,10 @@ class AceRuntime:
         save_path = str(self.output_dir / f"job_{job.id:06d}.wav")
         t0 = time.time()
         if self.engine == "v15":
+            # The latents' label, before the render: a missing one costs no GPU
+            # time and leaves no WAV behind (an error receipt is never acked, so
+            # the pruner would keep it forever).
+            revision = self._latents_revision()
             # v1.5 defaults: SFT wants ~30-60 steps, guidance 7 (APG), shift 3.
             # A v1-era guidance (>10) from an un-updated client is reset, since
             # 15 wrecks v1.5 output. Output is stereo 48kHz float.
@@ -1067,7 +1071,7 @@ class AceRuntime:
                 ).audios
                 decoded = _decode_latents(pipe, latents)
             wav = Path(save_path)
-            self._write_text2music(job, wav, latents, decoded)
+            self._write_text2music(job, wav, latents, decoded, revision=revision)
         else:
             with self._lock:
                 out = pipe(
@@ -1100,7 +1104,7 @@ class AceRuntime:
         print(f"[ace] job {job.id} -> {wav.name} {dur:.1f}s @ {sr}Hz "
               f"{time.time() - t0:.1f}s", flush=True)
 
-    def _write_text2music(self, job: Job, wav: Path, latents: Any, decoded: Any) -> None:
+    def _write_text2music(self, job: Job, wav: Path, latents: Any, decoded: Any, *, revision: str) -> None:
         """The pipeline's own output level (its two normalization stages are one
         gain, TARGET_PEAK / peak), written as PCM16 next to the latents."""
         import numpy as np
@@ -1108,7 +1112,7 @@ class AceRuntime:
 
         gain = TARGET_PEAK / max(float(np.abs(decoded).max()), 1e-6)
         sf.write(str(wav), _soft_clip(decoded * np.float32(gain)), ACE_SAMPLE_RATE, subtype="PCM_16")
-        self._store_latents(job, latents[0], gain_envelope=[[0, gain]], render_start_frame=0)
+        self._store_latents(job, latents[0], revision=revision, gain_envelope=[[0, gain]], render_start_frame=0)
 
     def continuation(self, job: Job) -> None:
         """Continue a track from its real audio (ace-latent-pin-v1).
@@ -1173,7 +1177,7 @@ class AceRuntime:
         out = _splice_continuation(request.scaffold, _pcm16(rendered), request.join_frame, request.crossfade_frames)
         sf.write(str(save_path), out, ACE_SAMPLE_RATE, subtype="PCM_16")
         join = request.join_frame * LATENT_HOP
-        self._store_latents(job, final[0, request.join_frame:],
+        self._store_latents(job, final[0, request.join_frame:], revision=revision,
                             gain_envelope=_shift_envelope(request.context_gain, join, cut),
                             render_start_frame=request.join_frame)
         source = "latents" if request.latents is not None else "audio"

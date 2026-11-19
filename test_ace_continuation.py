@@ -568,6 +568,22 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual((health["loaded"], health["preloading"], health["model_revision"]), (True, False, ""))
         self.assertIs(state.runtime._pipe, pipe)
 
+    def assert_fails_before_rendering(self, payload):
+        pipe = FakePipe()
+        with patch.dict(sys.modules, {"huggingface_hub": FakeHub()}):
+            _state, job = self.run_job(payload, pipe, revision="")
+        self.assertEqual((job.status, len(pipe.calls), list(self.root.glob("job_*"))), ("error", 0, []))
+        self.assertEqual((job.audios, job.latents_path), ([], ""))
+        self.assertIn(f"no HF snapshot revision found for {MODEL} (FileNotFoundError", job.error)
+
+    def test_text2music_without_a_revision_renders_and_writes_nothing(self):
+        """The revision used to be looked up after the GPU render and the WAV, which the pruner
+        then kept forever (an error receipt is never acknowledged)."""
+        self.assert_fails_before_rendering({"prompt": "fixture", "audio_duration": 2.0, "infer_step": 2})
+
+    def test_continuation_without_a_revision_renders_and_writes_nothing(self):
+        self.assert_fails_before_rendering(continuation_payload()[0])
+
 
 if __name__ == "__main__":
     unittest.main()
