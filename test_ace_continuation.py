@@ -5,6 +5,7 @@ import functools
 import io
 import math
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -21,6 +22,7 @@ import ace_step_server as server
 
 HOP = server.LATENT_HOP
 MODEL, REVISION = "ACE-Step/test-model", "0123456789abcdef"
+SNAPSHOT = REVISION + "0" * 24  # the cache's commit folder; the label is its first 16 chars
 
 
 class FakeVae:
@@ -100,6 +102,22 @@ class FakePipe:
         if output_type != "latent":
             raise AssertionError("the server decodes itself; it must ask for latents")
         return SimpleNamespace(audios=xt)
+
+
+class FakeHub:
+    """huggingface_hub over a local cache holding the model's `snapshot` folder; None =
+    not downloaded yet, where snapshot_download(local_files_only=True) raises."""
+
+    def __init__(self, snapshot=None):
+        self.snapshot, self.lookups = snapshot, 0
+
+    def snapshot_download(self, repo_id, *, local_files_only):
+        self.lookups += 1
+        if not local_files_only:
+            raise AssertionError("the revision lookup must never touch the network")
+        if self.snapshot is None:
+            raise FileNotFoundError("Cannot find an appropriate cached snapshot folder")
+        return f"/hf/hub/models--{repo_id.replace('/', '--')}/snapshots/{self.snapshot}"
 
 
 def wav_b64(samples, rate=48000, subtype="PCM_16"):
@@ -335,23 +353,43 @@ class RuntimeTests(unittest.TestCase):
             state.receipts.close()
         self.directory.cleanup()
 
-    def runtime(self, pipe):
+    def runtime(self, pipe, revision=REVISION):
         runtime = server.AceRuntime.__new__(server.AceRuntime)
         runtime.output_dir, runtime.engine, runtime.dtype, runtime.checkpoint_dir = self.root, "v15", "bfloat16", ""
-        runtime._lock, runtime._model_id, runtime._model_revision_cache = threading.Lock(), MODEL, REVISION
+        runtime._lock, runtime._model_id, runtime._model_revision_cache = threading.Lock(), MODEL, revision
         runtime._pipe, runtime._embed_model_id = pipe, "synthetic-embedder"
         runtime._load = lambda: pipe
         return runtime
 
-    def run_job(self, payload, pipe):
-        """One job through the real enqueue -> AppState._loop dispatch -> receipt."""
+    def state(self, pipe, revision=REVISION):
         with patch.object(threading.Thread, "start"), patch.dict(os.environ, {"ACE_WATCHDOG": "0"}):
-            state = server.AppState(self.runtime(pipe))
+            state = server.AppState(self.runtime(pipe, revision))
         self.states.append(state)
+        return state
+
+    def dispatch(self, state, payload):
+        """One job through the real enqueue -> AppState._loop dispatch -> receipt."""
         job = state.enqueue({"operation_id": "7f1c1c56-5a8e-4a43-9a43-07c1e8d5a0f1", **payload})
         with patch.object(state._queue, "task_done", side_effect=StopIteration), self.assertRaises(StopIteration):
             state._loop()
-        return state, state.get(job.id)
+        return state.get(job.id)
+
+    def run_job(self, payload, pipe, revision=REVISION):
+        state = self.state(pipe, revision)
+        return state, self.dispatch(state, payload)
+
+    def unloaded(self, pipe, hub, downloads):
+        """A server before its real _load(), and the modules it imports: from_pretrained
+        leaves snapshot `downloads` in the hub's cache (None = still none) and returns pipe."""
+        def from_pretrained(model_id, dtype):
+            self.assertEqual((model_id, dtype), (MODEL, torch.bfloat16))
+            hub.snapshot = downloads
+            return SimpleNamespace(to=lambda device: pipe)
+
+        state = self.state(None, revision="")
+        del state.runtime._load  # the real one
+        diffusers = SimpleNamespace(AceStepPipeline=SimpleNamespace(from_pretrained=from_pretrained))
+        return state, patch.dict(sys.modules, {"huggingface_hub": hub, "diffusers": diffusers})
 
     def test_continuation_from_stored_latents(self):
         pipe = FakePipe()
@@ -484,6 +522,51 @@ class RuntimeTests(unittest.TestCase):
         with patch.object(server.time, "sleep", side_effect=StopIteration), self.assertRaises(StopIteration):
             callbacks[0]()
         self.assertFalse(latents.exists())
+
+    def test_a_failed_revision_lookup_is_retried_not_cached(self):
+        """A lookup that missed (e.g. /health polled during the preload, before the snapshot
+        exists) used to cache "" and fail every later text2music and continuation until a
+        restart."""
+        hub = FakeHub()
+        state = self.state(FakePipe(), revision="")
+        with patch.dict(sys.modules, {"huggingface_hub": hub}):
+            self.assertEqual(self.get(state, "/health")[1]["model_revision"], "")
+            self.assertEqual(self.get(state, "/health")[1]["model_revision"], "")
+            hub.snapshot = SNAPSHOT  # the preload's download finished
+            job = self.dispatch(state, {"prompt": "fixture", "audio_duration": 2.0, "infer_step": 2})
+            self.assertEqual(self.get(state, "/health")[1]["model_revision"], REVISION)
+        self.assertEqual(job.status, "done", job.error)
+        self.assertEqual(job.latents["model_revision"], REVISION)
+        self.assertEqual(hub.lookups, 3)  # two misses, one hit, then the cache
+
+    def test_the_load_resolves_the_revision_it_loaded(self):
+        """A lookup before the load can see an older snapshot than the one the load downloads:
+        the load looks again, and a continuation is checked against what was loaded."""
+        old, new = "1" * 40, "2" * 40
+        pipe, hub = FakePipe(), FakeHub(old)
+        state, modules = self.unloaded(pipe, hub, downloads=new)
+        with modules:
+            self.assertEqual(self.get(state, "/health")[1]["model_revision"], old[:16])
+            self.assertEqual(state.runtime._model_revision_cache, "")  # a lookup before the load is not kept
+            job = self.dispatch(state, continuation_payload(latents_model_revision=old[:16])[0])
+            self.assertEqual(self.get(state, "/health")[1]["model_revision"], new[:16])
+        self.assertIs(state.runtime._pipe, pipe)
+        self.assertEqual(job.status, "error")
+        self.assertIn(f"come from {MODEL}@{old[:16]}; this renderer runs {MODEL}@{new[:16]}", job.error)
+        self.assertEqual((pipe.calls, list(self.root.glob("job_*"))), ([], []))
+
+    def test_a_revision_the_load_cannot_find_fails_the_preload(self):
+        """The preload reports it (the app routes no work to a box with a preload_error) instead
+        of every later job; the pipeline stays loaded for repaint, which needs no revision."""
+        pipe = FakePipe()
+        state, modules = self.unloaded(pipe, FakeHub(), downloads=None)
+        with modules:
+            state._preload_run()
+            health = self.get(state, "/health")[1]
+        self.assertTrue(health["preload_error"].startswith(
+            f"RuntimeError: no HF snapshot revision found for {MODEL} (FileNotFoundError: "), health["preload_error"])
+        self.assertEqual((health["loaded"], health["preloading"], health["model_revision"]), (True, False, ""))
+        self.assertIs(state.runtime._pipe, pipe)
 
 
 if __name__ == "__main__":

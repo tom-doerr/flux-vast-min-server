@@ -22,6 +22,7 @@ import json
 import math
 import os
 import queue
+import re
 import threading
 import time
 import traceback
@@ -673,6 +674,17 @@ def _pipeline_seed(payload: dict[str, Any]) -> dict[str, Any]:
     return {"generator": torch.Generator(device="cuda").manual_seed(int(payload["seed"]))}
 
 
+def _snapshot_revision(model_id: str) -> str:
+    """The commit sha (first 16 chars) of model_id's snapshot in the local HF
+    cache; raises when the cache has none. No network."""
+    from huggingface_hub import snapshot_download
+
+    path = Path(snapshot_download(model_id, local_files_only=True))
+    if path.parent.name != "snapshots" or not re.fullmatch(r"[0-9a-f]{40}", path.name):
+        raise RuntimeError(f"{path} is not an HF cache snapshot folder")
+    return path.name[:16]
+
+
 class AceRuntime:
     def __init__(self, *, output_dir: Path, checkpoint_dir: str, dtype: str = "bfloat16",
                  cpu_offload: bool = False, torch_compile: bool = False,
@@ -687,6 +699,7 @@ class AceRuntime:
         self._pipe: Any = None
         self._lock = threading.Lock()
         self._model_id = model_id or (DEFAULT_MODEL_V15 if engine == "v15" else DEFAULT_MODEL)
+        self._model_revision_cache = ""  # a found revision, looked up with the model loaded
         # CLAP audio embedder for on-box ridge/diversity (kind='audio'), mirrors
         # the wan box's VideoMAE embedder. Loaded lazily, separate from ACE-Step.
         self._embedder: Any = None
@@ -737,29 +750,33 @@ class AceRuntime:
 
     def model_revision(self) -> str:
         """The loaded checkpoint's HF snapshot sha (first 16 chars) = an exact
-        model hash for per-item provenance. Cached; local cache only (no net)."""
-        rev = getattr(self, "_model_revision_cache", None)
-        if rev is not None:
-            return rev
-        rev = ""
+        model hash for per-item provenance; "" while it cannot be found. Only a
+        found revision, looked up with the model loaded, is cached: /health
+        polled during the preload can look before the load has downloaded its
+        snapshot (a miss, or an older snapshot), and a cached miss would disable
+        every v15 latents job until a restart."""
+        if self._model_revision_cache:
+            return self._model_revision_cache
+        loaded = self._pipe is not None
         try:
-            from huggingface_hub import snapshot_download
-            p = snapshot_download(self._model_id, local_files_only=True).rstrip("/")
-            parts = p.split("/")
-            if "snapshots" in parts:
-                rev = parts[parts.index("snapshots") + 1][:16]
-        except Exception:
-            rev = ""
-        self._model_revision_cache = rev
-        return rev
+            revision = _snapshot_revision(self._model_id)
+        except Exception:  # noqa: BLE001 -- "" = unknown here; _latents_revision raises the cause
+            return ""
+        if loaded:
+            self._model_revision_cache = revision
+        return revision
 
     def _latents_revision(self) -> str:
-        """Latents are only reusable by the exact model that made them."""
-        revision = self.model_revision()
-        if not revision:
-            raise RuntimeError(f"no HF snapshot revision found for {self._model_id}; "
-                               "latents cannot be labelled with their model")
-        return revision
+        """The revision latents are labelled with: they are only reusable by the
+        exact model that made them. Called with the model loaded; raises when
+        the revision cannot be found (the next call looks again)."""
+        if not self._model_revision_cache:
+            try:
+                self._model_revision_cache = _snapshot_revision(self._model_id)
+            except Exception as exc:  # noqa: BLE001 -- re-raised with the model and the cause
+                raise RuntimeError(f"no HF snapshot revision found for {self._model_id} ({type(exc).__name__}: "
+                                   f"{exc}); latents cannot be labelled with their model") from exc
+        return self._model_revision_cache
 
     def _store_latents(self, job: Job, latents: Any, *, gain_envelope: list[list[float]],
                        render_start_frame: int) -> None:
@@ -787,6 +804,13 @@ class AceRuntime:
                 dtype = torch.bfloat16 if self.dtype == "bfloat16" else torch.float16
                 self._pipe = AceStepPipeline.from_pretrained(self._model_id, dtype=dtype).to("cuda")
                 print(f"loaded ACE-Step 1.5 ({self._model_id}, {self.dtype})", flush=True)
+                # Every v15 render labels its latents with the revision: look it up now
+                # that the load has its snapshot, so the label names what was loaded and
+                # a missing one fails the preload here, not each later job. The pipeline
+                # stays loaded: repaint needs no revision, and each job that labels
+                # latents looks again.
+                self._model_revision_cache = ""
+                print(f"model revision {self._latents_revision()}", flush=True)
                 return self._pipe
             from acestep.pipeline_ace_step import ACEStepPipeline
 
@@ -1105,13 +1129,16 @@ class AceRuntime:
         import torch
 
         p = job.payload or {}
-        request = _continuation_request(p, model=self._model_id, revision=self._latents_revision())
+        # Load first: the context latents must match the revision that was loaded,
+        # not one a lookup saw before the load downloaded the model.
+        pipe = self._load()
+        revision = self._latents_revision()
+        request = _continuation_request(p, model=self._model_id, revision=revision)
         context, generate = request.context_frames, request.generate_frames
         total = context + generate
         g = float(p.get("guidance_scale", 7.0))
         if g > 10.0:
             g = 7.0
-        pipe = self._load()
         scaffold = torch.from_numpy(np.ascontiguousarray(request.scaffold.T, dtype=np.float32) / 32768.0)
         save_path = self.output_dir / f"job_{job.id:06d}.wav"
         t0 = time.time()
