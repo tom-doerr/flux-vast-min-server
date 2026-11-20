@@ -60,6 +60,11 @@ MIN_CONTINUATION_FRAMES = 25  # 1 s of context and of new audio
 # this many frames before the first new latent, so it blends only audio that
 # decodes from the parent's context.
 DECODER_REACH_FRAMES = 10
+# A context re-encoded from audio decodes hot: decode(encode(x).mode()) came back
+# 1.32 dB above the parent by least squares (corr 0.99, spark-3, Nov 20 2026), so
+# without a fitted gain the join steps up in level. Below this RMS (-60 dBFS) the
+# context is effectively silence and has no level to match.
+FIT_MIN_RMS = 1e-3
 
 
 def _normalize_repaint_spans(raw: Any) -> list[tuple[float, float]]:
@@ -436,7 +441,7 @@ def _continuation_request(payload: dict[str, Any], *, model: str, revision: str)
         raise ValueError("context_gain, latents_model and latents_model_revision belong to a request "
                          "that sends context_latents_b64")
     else:
-        gain = [(0, 1.0)]  # re-encoded from the stored audio, which is already at its stored level
+        gain = [(0, 1.0)]  # re-encoded from the stored audio; continuation() fits the level after the decode
     scaffold = _read_scaffold(payload.get("audio_b64"), (context + generate) * LATENT_HOP)
     if scaffold[context * LATENT_HOP:].any():
         raise ValueError("scaffold must be digital silence after the context frames")
@@ -558,6 +563,28 @@ def _pinned_denoise(pipe: Any, *, context: Any, noise: Any, context_frames: int,
     if not torch.equal(final[:, :context_frames], context32.to(final.dtype)):
         raise RuntimeError("final context latents differ from the pinned parent latents")
     return final
+
+
+def _fit_context_gain(scaffold: Any, decoded: Any, context_frames: int) -> tuple[float, dict[str, Any] | None]:
+    """Least-squares gain that maps the decode of a re-encoded context onto the
+    scaffold, fitted where neither window edge nor the new latents reach.
+    Returns (gain, fit diagnostics); (1.0, None) for an effectively silent context."""
+    import numpy as np
+
+    lo, hi = DECODER_REACH_FRAMES * LATENT_HOP, (context_frames - DECODER_REACH_FRAMES) * LATENT_HOP
+    reference = scaffold[lo:hi].astype(np.float64) / 32768.0
+    decode = decoded[lo:hi].astype(np.float64)
+    if float(np.sqrt(np.mean(reference ** 2))) < FIT_MIN_RMS:
+        return 1.0, None
+    energy = float((decode * decode).sum())
+    gain = float((reference * decode).sum()) / energy if energy > 0 else 0.0
+    if not 0.25 <= gain <= 4.0:
+        raise RuntimeError(f"the re-encoded context fits gain {gain:.4f}; its decode does not reproduce "
+                           "the parent's audio")
+    fitted = (gain * decode).ravel()
+    correlation = float(np.corrcoef(reference.ravel(), fitted)[0, 1]) if fitted.std() > 0 else None
+    return gain, {"gain": gain, "gain_db": 20 * math.log10(gain), "correlation": correlation,
+                  "frames": [lo // LATENT_HOP, hi // LATENT_HOP]}
 
 
 def _continuation_diagnostics(source: str, request: ContinuationRequest, rendered: Any,
@@ -1170,7 +1197,11 @@ class AceRuntime:
                 audio_duration=total * LATENT_HOP / ACE_SAMPLE_RATE, guidance_scale=g, src_audio=scaffold)
             decoded = _decode_latents(pipe, final)
         cut = context * LATENT_HOP
-        unclipped = decoded * _gain_envelope(request.context_gain, total * LATENT_HOP, cut)[:, None]
+        context_gain, gain_fit = request.context_gain, None
+        if request.latents is None:  # stored latents carry their exact gain; a re-encode needs a fit
+            fitted, gain_fit = _fit_context_gain(request.scaffold, decoded, context)
+            context_gain = [(0, fitted)]
+        unclipped = decoded * _gain_envelope(context_gain, total * LATENT_HOP, cut)[:, None]
         if not np.isfinite(unclipped).all():
             raise ValueError("decode * context_gain overflows float32")
         rendered = _soft_clip(unclipped)
@@ -1178,10 +1209,11 @@ class AceRuntime:
         sf.write(str(save_path), out, ACE_SAMPLE_RATE, subtype="PCM_16")
         join = request.join_frame * LATENT_HOP
         self._store_latents(job, final[0, request.join_frame:], revision=revision,
-                            gain_envelope=_shift_envelope(request.context_gain, join, cut),
+                            gain_envelope=_shift_envelope(context_gain, join, cut),
                             render_start_frame=request.join_frame)
         source = "latents" if request.latents is not None else "audio"
-        job.continuation = _continuation_diagnostics(source, request, rendered, unclipped)
+        job.continuation = {**_continuation_diagnostics(source, request, rendered, unclipped),
+                            "context_gain_fit": gain_fit}
         dur, sr = _wav_info(save_path)
         rec = AudioRecord(save_path, dur, sr)
         waveform = save_path.with_name(save_path.stem + ".waveform.png")

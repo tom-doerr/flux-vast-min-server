@@ -445,9 +445,40 @@ class RuntimeTests(unittest.TestCase):
         mean = pipe.vae.encode(context.to(torch.bfloat16)).latent_dist.mode().transpose(1, 2)
         self.assertTrue(torch.equal(pipe.trace[-1][:, :40], mean))
         self.assertEqual(job.continuation["context_source"], "audio")
-        self.assertEqual(job.latents["gain_envelope"], [[0, 1.0]])
+        fit = job.continuation["context_gain_fit"]
+        self.assertEqual(fit["frames"], [10, 30])
+        self.assertEqual(job.latents["gain_envelope"], [[0, fit["gain"]]])
         out = sf.read(job.audios[0].path, dtype="int16", always_2d=True)[0]
         np.testing.assert_array_equal(out[:27 * HOP], scaffold[:27 * HOP])
+
+    def test_continuation_from_audio_fits_the_level_of_the_parent(self):
+        """A re-encoded context decodes hot (1.32 dB on the real VAE): the fitted gain
+        brings the decode, and so the new audio, back to the parent's level."""
+        class HotVae(FakeVae):
+            def decode(self, latents):
+                return SimpleNamespace(sample=1.25 * latents[:, :2].repeat_interleave(HOP, dim=-1))
+
+        pipe = FakePipe()
+        pipe.vae = HotVae()
+        payload, scaffold = continuation_payload(latents=False)
+        _state, job = self.run_job(payload, pipe)
+        self.assertEqual(job.status, "done", job.error)
+        fit = job.continuation["context_gain_fit"]
+        self.assertAlmostEqual(fit["gain"], 0.8, delta=0.01)
+        self.assertEqual(job.latents["gain_envelope"], [[0, fit["gain"]]])
+        out = sf.read(job.audios[0].path, dtype="int16", always_2d=True)[0].astype(np.float64)
+        # After the crossfade the decode (per-frame means, see FakeVae) sits at the scaffold's level.
+        means = scaffold[28 * HOP:40 * HOP].astype(np.float64).reshape(12, HOP, 2).mean(axis=1)
+        np.testing.assert_allclose(out[28 * HOP:40 * HOP:HOP], means, atol=60)
+
+    def test_a_silent_context_keeps_unit_gain(self):
+        payload, _scaffold = continuation_payload(latents=False)
+        silent = np.zeros(((40 + 30) * HOP, 2), dtype=np.int16)
+        payload["audio_b64"] = wav_b64(silent)
+        _state, job = self.run_job(payload, FakePipe())
+        self.assertEqual(job.status, "done", job.error)
+        self.assertIsNone(job.continuation["context_gain_fit"])
+        self.assertEqual(job.latents["gain_envelope"], [[0, 1.0]])
 
     def test_failed_validation_fails_the_job_and_writes_nothing(self):
         _state, job = self.run_job(continuation_payload(latents_model="other/model")[0], FakePipe())
